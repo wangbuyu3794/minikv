@@ -95,7 +95,70 @@ if(BUILD_TESTING)
         COMMAND minikv-server --help
     )
 
-    set_tests_properties(minikv.server.help PROPERTIES
+    add_test(
+        NAME minikv.server.short-help
+        COMMAND minikv-server -h
+    )
+
+    set_tests_properties(
+        minikv.server.help
+        minikv.server.short-help
+        PROPERTIES
         PASS_REGULAR_EXPRESSION "Usage: minikv-server"
     )
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(minikv_server_linux_test
+            tests/server_linux_test.c
+        )
+
+        target_include_directories(minikv_server_linux_test
+            PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        )
+
+        target_link_libraries(minikv_server_linux_test
+            PRIVATE
+                minikv_server_runtime
+        )
+
+        set_target_properties(minikv_server_linux_test PROPERTIES
+            C_STANDARD 17
+            C_STANDARD_REQUIRED ON
+            C_EXTENSIONS OFF
+        )
+
+        minikv_enable_warnings(minikv_server_linux_test)
+
+        add_test(
+            NAME minikv.server.linux
+            COMMAND minikv_server_linux_test
+        )
+
+        set_tests_properties(minikv.server.linux PROPERTIES
+            TIMEOUT 15
+        )
+
+        add_executable(minikv_server_integration_test
+            tests/server_integration_test.c
+        )
+
+        set_target_properties(minikv_server_integration_test PROPERTIES
+            C_STANDARD 17
+            C_STANDARD_REQUIRED ON
+            C_EXTENSIONS OFF
+        )
+
+        minikv_enable_warnings(minikv_server_integration_test)
+
+        add_test(
+            NAME minikv.server.integration
+            COMMAND minikv_server_integration_test
+                    $<TARGET_FILE:minikv-server>
+        )
+
+        set_tests_properties(minikv.server.integration PROPERTIES
+            TIMEOUT 15
+        )
+    endif()
 endif()
