@@ -1,66 +1,165 @@
 # MiniKV
 
-MiniKV is an educational key-value database written in C17. Its primary target
-platform is Linux, with development and Linux validation performed through WSL
-when the host is Windows.
+MiniKV is an educational key-value server written in C17. The project aims to
+build a Redis-compatible protocol and database features incrementally, with
+Linux as its primary runtime platform.
 
-The M0 milestone intentionally contains only a minimal, buildable, and testable
-project skeleton. It provides a small core library, a command-line entry point,
-and smoke tests. It does not yet implement a database server.
+The current M1 milestone provides only the network server skeleton. It does not
+implement RESP, `SET`, `GET`, TTL, persistence, or a functional key-value
+database, and it cannot be used as a Redis replacement.
+
+## M1 status
+
+On Linux, the server currently provides:
+
+- an IPv4 TCP listener;
+- nonblocking and close-on-exec file descriptors;
+- level-triggered epoll;
+- accept queue draining;
+- receiving and discarding client data;
+- cleanup when clients disconnect;
+- SIGINT and SIGTERM handling through signalfd;
+- a successful exit status after a normal signal-driven stop.
+
+Client data is not parsed, and the server sends no protocol response. No Redis
+commands are implemented.
 
 ## Requirements
 
 - CMake 3.16 or newer
-- A C17-capable C compiler
-- A CMake generator supported by the local toolchain
+- a C17-capable C compiler
+- a CMake generator supported by the local toolchain
 
 MiniKV has no third-party runtime dependencies.
 
-## Layout
+## Platform support
+
+Linux uses the real socket, epoll, and signalfd backend. Other platforms can
+build the command-line program and the unsupported backend; help remains
+available, but attempting to start the server normally reports that the network
+service is unsupported and returns an error.
+
+A Windows build validates only the platform-neutral CLI and core behavior. It
+does not compile or validate the Linux network backend.
+
+## Command-line interface
+
+The current defaults are:
+
+- bind address: `127.0.0.1`
+- port: `6379`
+
+`--bind` accepts only a numeric IPv4 address. `--port` accepts values from 0
+through 65535; port 0 asks the operating system to allocate an ephemeral port.
+Hostnames, IPv6, and configuration files are not supported.
+
+Examples:
+
+```sh
+minikv-server --help
+minikv-server -h
+minikv-server
+minikv-server --bind 127.0.0.1 --port 6380
+minikv-server --bind 127.0.0.1 --port 0
+```
+
+After a successful start, the server prints the actual listening address and
+port:
 
 ```text
-apps/             Executable entry points
-include/minikv/   Public headers
-src/              Reusable implementation
-tests/            Lightweight C tests
+MiniKV listening on 127.0.0.1:<port>
 ```
+
+The current exit-status behavior is:
+
+- `0`: help was displayed, or the server stopped normally;
+- `1`: a runtime or backend error, such as an invalid bind address or an
+  unsupported platform;
+- `2`: a command-line syntax error, such as an unknown, duplicate, missing, or
+  out-of-range argument.
+
+## Build and test on Linux
+
+Run these commands from the repository root:
+
+```sh
+cmake -S . -B build/linux \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DBUILD_TESTING=ON
+
+cmake --build build/linux --parallel
+
+ctest --test-dir build/linux \
+  --output-on-failure \
+  --no-tests=error
+```
+
+Linux registers these CTest tests:
+
+- `minikv.smoke`
+- `minikv.server.help`
+- `minikv.server.short-help`
+- `minikv.server.linux`
+- `minikv.server.integration`
+
+The lifecycle test directly exercises the runtime interface, file-descriptor
+flags, accept draining, data draining, and connection cleanup. The integration
+test uses fork and exec to start the real `minikv-server` executable and checks
+ephemeral-port startup, a real TCP connection, SIGTERM shutdown, and CLI exit
+statuses.
 
 ## Build and test on Windows
 
-Use a dedicated build tree so Windows artifacts are not mixed with WSL
-artifacts:
+The following example uses MinGW Makefiles and a dedicated Windows build tree:
 
 ```powershell
-cmake -S . -B build/windows
-cmake --build build/windows --config Debug
-ctest --test-dir build/windows -C Debug --output-on-failure
-```
+cmake -S . -B build/windows -G "MinGW Makefiles" `
+  -DCMAKE_BUILD_TYPE=Debug `
+  -DBUILD_TESTING=ON
 
-For a single-configuration generator such as Ninja, select the configuration
-during configure instead:
+cmake --build build/windows --parallel
 
-```powershell
-cmake -S . -B build/windows -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/windows
 ctest --test-dir build/windows --output-on-failure
 ```
 
-## Build and test on WSL/Linux
+Windows registers only the platform-neutral tests:
 
-Run these commands from the repository root inside WSL:
+- `minikv.smoke`
+- `minikv.server.help`
+- `minikv.server.short-help`
 
-```sh
-cmake -S . -B build/wsl -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/wsl
-ctest --test-dir build/wsl --output-on-failure
-./build/wsl/minikv-server --help
+## Repository layout
+
+```text
+.github/workflows/ci.yml
+apps/minikv_server.c
+include/minikv/version.h
+src/version.c
+src/server_internal.h
+src/server_linux.c
+src/server_unsupported.c
+tests/smoke_test.c
+tests/server_linux_test.c
+tests/server_integration_test.c
+CMakeLists.txt
+README.md
 ```
 
-## M0 behavior
+Executable entry points live in `apps/`, reusable implementation lives in
+`src/`, public headers live under `include/minikv/`, and tests live in `tests/`.
+`src/server_internal.h` is an internal runtime and test interface, not a stable
+public API.
 
-`minikv-server --help` and `minikv-server -h` print usage information. Running
-the program without arguments reports that the M0 skeleton cannot start a
-server and exits with a nonzero status.
+## Current limitations
 
-Networking, RESP2, the key-value data structure, AOF persistence, and
-configuration files are deliberately outside the M0 scope.
+- no RESP parser;
+- no command execution;
+- no database storage;
+- no TTL;
+- no persistence;
+- no authentication;
+- only numeric IPv4 bind addresses;
+- the Linux network backend is the primary supported runtime.
+
+Planned directions include a RESP parser, basic commands, an in-memory
+database, TTL, and persistence. No release dates are promised.
