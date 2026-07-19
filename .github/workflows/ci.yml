@@ -1,0 +1,61 @@
+name: Linux CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        compiler:
+          - gcc
+          - clang
+        build_type:
+          - Debug
+          - Release
+    env:
+      CC: ${{ matrix.compiler }}
+      BUILD_DIR: build/ci-${{ matrix.compiler }}-${{ matrix.build_type }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Environment information
+        run: |
+          set -euxo pipefail
+          cmake --version
+          "${CC}" --version
+
+      - name: Configure
+        run: |
+          set -euxo pipefail
+          cmake -S . -B "${BUILD_DIR}" \
+            -DCMAKE_BUILD_TYPE="${{ matrix.build_type }}" \
+            -DCMAKE_C_COMPILER="${CC}" \
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          cmake --build "${BUILD_DIR}" --parallel
+
+      - name: Test
+        run: |
+          set -euxo pipefail
+          ctest --test-dir "${BUILD_DIR}" --output-on-failure --no-tests=error
+
+      - name: Show server help
+        run: |
+          set -euxo pipefail
+          "${BUILD_DIR}/minikv-server" --help
