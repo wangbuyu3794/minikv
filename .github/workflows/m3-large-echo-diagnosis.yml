@@ -1,0 +1,968 @@
+name: M3 Large ECHO Diagnosis
+
+on:
+  push:
+    branches:
+      - validation/m3-large-echo-diagnosis
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            build_type: Debug
+          - compiler: clang
+            build_type: Release
+
+    env:
+      BUILD_DIR: build/m3-diagnosis-${{ matrix.compiler }}-${{ matrix.build_type }}
+      CC: ${{ matrix.compiler }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Environment information
+        run: |
+          set -euxo pipefail
+          uname -a
+          cmake --version
+          "$CC" --version
+          python3 --version
+          echo "compiler=${{ matrix.compiler }}"
+          echo "build_type=${{ matrix.build_type }}"
+
+      - name: Configure testing build
+        run: |
+          set -euxo pipefail
+          cmake -S . -B "$BUILD_DIR" \
+            -DCMAKE_BUILD_TYPE="${{ matrix.build_type }}" \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          set +e
+          cmake --build "$BUILD_DIR" --parallel \
+            2>&1 | tee "$RUNNER_TEMP/m3-diagnosis-build.log"
+          build_status=${PIPESTATUS[0]}
+          set -e
+          echo "build exit code: $build_status"
+          exit "$build_status"
+
+      - name: Verify project compiler warnings
+        run: |
+          set -euxo pipefail
+          python3 - "$RUNNER_TEMP/m3-diagnosis-build.log" <<'PY'
+          import sys
+          from pathlib import Path
+
+          lines = Path(sys.argv[1]).read_text(
+              encoding="utf-8",
+              errors="replace",
+          ).splitlines()
+          warnings = [line for line in lines if "warning:" in line.lower()]
+          if warnings:
+              print("project compiler warnings:", file=sys.stderr)
+              for line in warnings:
+                  print(line, file=sys.stderr)
+              raise SystemExit(1)
+          print("project compiler warnings: 0")
+          PY
+
+      - name: Reproduce formal integration test
+        run: |
+          set -euxo pipefail
+          set +e
+          ctest --test-dir "$BUILD_DIR" \
+            --verbose \
+            --no-tests=error \
+            -R '^minikv\.server\.integration$' \
+            2>&1 | tee "$RUNNER_TEMP/formal-integration.log"
+          formal_status=${PIPESTATUS[0]}
+          set -e
+          echo "$formal_status" > "$RUNNER_TEMP/formal-integration.status"
+          echo "formal integration exit code: $formal_status"
+
+      - name: Run large ECHO diagnosis
+        run: |
+          set -euxo pipefail
+          cat > "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
+          import argparse
+          import errno
+          import json
+          import os
+          import re
+          import select
+          import signal
+          import socket
+          import subprocess
+          import threading
+          import time
+          import traceback
+          from pathlib import Path
+
+          PAYLOAD_SIZE = 1024 * 1024
+          REQUESTED_SMALL_RCVBUF = 1024
+          START_TIMEOUT = 5.0
+          SEND_TIMEOUT = 5.0
+          PING_TIMEOUT = 5.0
+          STOP_TIMEOUT = 3.0
+          KILL_TIMEOUT = 2.0
+          PONG = b"+PONG\r\n"
+          SNAPSHOTS = (1, 2, 5, 10, 20, 30)
+
+
+          def remaining_milliseconds(deadline):
+              remaining = deadline - time.monotonic()
+              if remaining <= 0.0:
+                  return 0
+              return max(1, int(remaining * 1000.0 + 0.999))
+
+
+          def wait_for_fd(file_descriptor, events, deadline):
+              poller = select.poll()
+              poller.register(file_descriptor, events)
+              while True:
+                  timeout = remaining_milliseconds(deadline)
+                  if timeout == 0:
+                      return 0
+                  try:
+                      ready = poller.poll(timeout)
+                  except InterruptedError:
+                      continue
+                  if not ready:
+                      return 0
+                  return ready[0][1]
+
+
+          def connect_client(port, requested_rcvbuf=None, timeout=PING_TIMEOUT):
+              client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              client.setblocking(False)
+              before = client.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+              deadline = time.monotonic() + timeout
+              error = client.connect_ex(("127.0.0.1", port))
+              if error not in (0, errno.EINPROGRESS, errno.EINTR):
+                  client.close()
+                  raise OSError(error, os.strerror(error))
+
+              if error != 0:
+                  events = wait_for_fd(
+                      client.fileno(),
+                      select.POLLOUT | select.POLLERR | select.POLLHUP,
+                      deadline,
+                  )
+                  if events == 0:
+                      client.close()
+                      raise TimeoutError("client connect timed out")
+                  socket_error = client.getsockopt(
+                      socket.SOL_SOCKET,
+                      socket.SO_ERROR,
+                  )
+                  if socket_error != 0:
+                      client.close()
+                      raise OSError(socket_error, os.strerror(socket_error))
+
+              if requested_rcvbuf is not None:
+                  client.setsockopt(
+                      socket.SOL_SOCKET,
+                      socket.SO_RCVBUF,
+                      requested_rcvbuf,
+                  )
+              after = client.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+              return client, before, after
+
+
+          def send_all(client, data, timeout=SEND_TIMEOUT):
+              view = memoryview(data)
+              offset = 0
+              deadline = time.monotonic() + timeout
+              while offset < len(view):
+                  try:
+                      sent = client.send(view[offset:], socket.MSG_NOSIGNAL)
+                  except InterruptedError:
+                      continue
+                  except BlockingIOError:
+                      events = wait_for_fd(
+                          client.fileno(),
+                          select.POLLOUT | select.POLLERR | select.POLLHUP,
+                          deadline,
+                      )
+                      if events == 0:
+                          raise TimeoutError("client send timed out")
+                      continue
+                  if sent <= 0:
+                      raise OSError("client send made no progress")
+                  offset += sent
+
+
+          def recv_exact(client, expected, timeout):
+              offset = 0
+              deadline = time.monotonic() + timeout
+              while offset < len(expected):
+                  try:
+                      received = client.recv(len(expected) - offset)
+                  except InterruptedError:
+                      continue
+                  except BlockingIOError:
+                      events = wait_for_fd(
+                          client.fileno(),
+                          select.POLLIN | select.POLLERR | select.POLLHUP,
+                          deadline,
+                      )
+                      if events == 0:
+                          raise TimeoutError("client recv timed out")
+                      continue
+                  if received == b"":
+                      raise EOFError(
+                          f"unexpected EOF with {len(expected) - offset} "
+                          "bytes missing"
+                      )
+                  if received != expected[offset:offset + len(received)]:
+                      raise AssertionError("response bytes differ")
+                  offset += len(received)
+
+
+          def ping_server(port):
+              started = time.monotonic()
+              result = {
+                  "connected": False,
+                  "pong_exact": False,
+                  "elapsed_seconds": None,
+                  "error": None,
+              }
+              client = None
+              try:
+                  client, _, _ = connect_client(port, timeout=PING_TIMEOUT)
+                  result["connected"] = True
+                  send_all(client, b"*1\r\n$4\r\nPING\r\n", PING_TIMEOUT)
+                  recv_exact(client, PONG, PING_TIMEOUT)
+                  result["pong_exact"] = True
+              except BaseException as error:
+                  result["error"] = f"{type(error).__name__}: {error}"
+              finally:
+                  if client is not None:
+                      client.close()
+                  result["elapsed_seconds"] = round(
+                      time.monotonic() - started,
+                      6,
+                  )
+              return result
+
+
+          class ServerProcess:
+              def __init__(self, executable, pid_path):
+                  self.executable = os.path.abspath(executable)
+                  self.pid_path = Path(pid_path)
+                  self.process = None
+                  self.port = None
+                  self.readiness_line = b""
+                  self.stdout = b""
+                  self.stderr = b""
+
+              def start(self):
+                  self.process = subprocess.Popen(
+                      [
+                          self.executable,
+                          "--bind",
+                          "127.0.0.1",
+                          "--port",
+                          "0",
+                      ],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      bufsize=0,
+                  )
+                  self.pid_path.write_text(
+                      f"{self.process.pid}\n",
+                      encoding="ascii",
+                  )
+                  deadline = time.monotonic() + START_TIMEOUT
+                  line = bytearray()
+                  while b"\n" not in line:
+                      if self.process.poll() is not None:
+                          raise RuntimeError(
+                              "server exited before readiness: "
+                              f"{self.process.returncode}"
+                          )
+                      events = wait_for_fd(
+                          self.process.stdout.fileno(),
+                          select.POLLIN | select.POLLHUP,
+                          deadline,
+                      )
+                      if events == 0:
+                          raise TimeoutError("server readiness timed out")
+                      chunk = os.read(self.process.stdout.fileno(), 1)
+                      if chunk == b"":
+                          raise EOFError("server stdout closed before readiness")
+                      line.extend(chunk)
+                      if len(line) > 128:
+                          raise RuntimeError("server readiness line is too long")
+
+                  self.readiness_line = bytes(line)
+                  match = re.fullmatch(
+                      rb"MiniKV listening on 127\.0\.0\.1:(\d+)\r?\n",
+                      self.readiness_line,
+                  )
+                  if match is None:
+                      raise RuntimeError(
+                          f"invalid readiness line: {self.readiness_line!r}"
+                      )
+                  self.port = int(match.group(1))
+                  if not 1 <= self.port <= 65535:
+                      raise RuntimeError(f"invalid readiness port: {self.port}")
+
+              def alive(self):
+                  return (
+                      self.process is not None
+                      and self.process.poll() is None
+                  )
+
+              def stop(self):
+                  if self.process is None:
+                      return None
+                  if self.process.poll() is None:
+                      self.process.send_signal(signal.SIGTERM)
+                      try:
+                          self.process.wait(timeout=STOP_TIMEOUT)
+                      except subprocess.TimeoutExpired:
+                          self.process.kill()
+                          self.process.wait(timeout=KILL_TIMEOUT)
+                  remaining_stdout, self.stderr = self.process.communicate(
+                      timeout=KILL_TIMEOUT
+                  )
+                  self.stdout = self.readiness_line + remaining_stdout
+                  try:
+                      self.pid_path.unlink()
+                  except FileNotFoundError:
+                      pass
+                  return self.process.returncode
+
+
+          def initial_scenario_result(
+              name,
+              requested_rcvbuf,
+              payload_size,
+              expected_size,
+          ):
+              result = {
+                  "name": name,
+                  "requested_rcvbuf": requested_rcvbuf,
+                  "actual_rcvbuf_before_connect": None,
+                  "actual_rcvbuf_after_connect": None,
+                  "payload_size": payload_size,
+                  "expected_response_size": expected_size,
+                  "read_delay_seconds": None,
+                  "formal_isolation_ping": None,
+                  "first_byte_seconds": None,
+                  "bytes_at_1s": None,
+                  "bytes_at_2s": None,
+                  "bytes_at_5s": None,
+                  "bytes_at_10s": None,
+                  "bytes_at_20s": None,
+                  "bytes_at_30s": None,
+                  "total_received": 0,
+                  "completion_seconds": None,
+                  "eof_seen": False,
+                  "response_exact_match": False,
+                  "extra_bytes_seen": False,
+                  "ping_after_echo_success": False,
+                  "server_alive_at_5s": None,
+                  "server_alive_at_10s": None,
+                  "server_exited_during_scenario": False,
+                  "server_exit_code": None,
+                  "second_client_ping_at_5s": None,
+                  "second_client_ping_at_10s": None,
+                  "last_progress_seconds": None,
+                  "stall_duration_seconds": None,
+                  "ss_at_5s": None,
+                  "ss_at_10s": None,
+                  "server_stdout": None,
+                  "server_stderr": None,
+                  "error": None,
+              }
+              return result
+
+
+          def run_scenario(
+              name,
+              executable,
+              pid_path,
+              request,
+              expected,
+              requested_rcvbuf,
+              use_formal_delay,
+              deadline_seconds,
+              schedule_isolation_checks,
+          ):
+              result = initial_scenario_result(
+                  name,
+                  requested_rcvbuf,
+                  PAYLOAD_SIZE,
+                  len(expected),
+              )
+              server = ServerProcess(executable, pid_path)
+              client = None
+              probe_threads = {}
+              probe_results = {}
+              probe_lock = threading.Lock()
+              read_started = None
+              last_progress_time = None
+              reached = set()
+              total = 0
+              exact = True
+
+              def probe_worker(second):
+                  probe = ping_server(server.port)
+                  with probe_lock:
+                      probe_results[second] = probe
+
+              def start_probe(second):
+                  thread = threading.Thread(
+                      target=probe_worker,
+                      args=(second,),
+                      daemon=True,
+                  )
+                  probe_threads[second] = thread
+                  thread.start()
+
+              try:
+                  server.start()
+                  client, before, after = connect_client(
+                      server.port,
+                      requested_rcvbuf=requested_rcvbuf,
+                      timeout=PING_TIMEOUT,
+                  )
+                  result["actual_rcvbuf_before_connect"] = before
+                  result["actual_rcvbuf_after_connect"] = after
+                  send_all(client, request, SEND_TIMEOUT)
+
+                  delay_started = time.monotonic()
+                  if use_formal_delay:
+                      result["formal_isolation_ping"] = ping_server(server.port)
+                  result["read_delay_seconds"] = round(
+                      time.monotonic() - delay_started,
+                      6,
+                  )
+
+                  read_started = time.monotonic()
+                  last_progress_time = read_started
+                  deadline = read_started + deadline_seconds
+
+                  while total < len(expected):
+                      now = time.monotonic()
+                      elapsed = now - read_started
+
+                      for second in SNAPSHOTS:
+                          if second in reached or elapsed < second:
+                              continue
+                          reached.add(second)
+                          result[f"bytes_at_{second}s"] = total
+                          if second == 5:
+                              result["server_alive_at_5s"] = server.alive()
+                          if second == 10:
+                              result["server_alive_at_10s"] = server.alive()
+                          if (
+                              schedule_isolation_checks
+                              and second in (5, 10)
+                              and total < len(expected)
+                          ):
+                              start_probe(second)
+
+                      if not server.alive():
+                          result["server_exited_during_scenario"] = True
+                          result["error"] = (
+                              "server exited before response completion"
+                          )
+                          break
+
+                      if now >= deadline:
+                          break
+
+                      next_times = [deadline]
+                      for second in SNAPSHOTS:
+                          if second not in reached:
+                              next_times.append(read_started + second)
+                      poll_deadline = min(next_times)
+                      events = wait_for_fd(
+                          client.fileno(),
+                          select.POLLIN | select.POLLERR | select.POLLHUP,
+                          poll_deadline,
+                      )
+                      if events == 0:
+                          continue
+
+                      try:
+                          received = client.recv(len(expected) - total)
+                      except InterruptedError:
+                          continue
+                      except BlockingIOError:
+                          continue
+
+                      if received == b"":
+                          result["eof_seen"] = True
+                          result["error"] = (
+                              "EOF before complete response"
+                          )
+                          break
+
+                      if result["first_byte_seconds"] is None:
+                          result["first_byte_seconds"] = round(
+                              time.monotonic() - read_started,
+                              6,
+                          )
+                      if received != expected[total:total + len(received)]:
+                          exact = False
+                          result["error"] = "response content mismatch"
+                          total += len(received)
+                          last_progress_time = time.monotonic()
+                          break
+                      total += len(received)
+                      last_progress_time = time.monotonic()
+                      result["last_progress_seconds"] = round(
+                          last_progress_time - read_started,
+                          6,
+                      )
+
+                  finished_at = time.monotonic()
+                  result["total_received"] = total
+                  result["stall_duration_seconds"] = round(
+                      finished_at - last_progress_time,
+                      6,
+                  )
+
+                  if total == len(expected) and exact:
+                      result["completion_seconds"] = round(
+                          finished_at - read_started,
+                          6,
+                      )
+                      result["response_exact_match"] = True
+
+                      extra_deadline = time.monotonic() + 0.1
+                      events = wait_for_fd(
+                          client.fileno(),
+                          select.POLLIN | select.POLLERR | select.POLLHUP,
+                          extra_deadline,
+                      )
+                      if events != 0:
+                          try:
+                              extra = client.recv(1)
+                          except (BlockingIOError, InterruptedError):
+                              extra = None
+                          if extra == b"":
+                              result["eof_seen"] = True
+                              result["error"] = (
+                                  "EOF after ECHO before reuse PING"
+                              )
+                          elif extra:
+                              result["extra_bytes_seen"] = True
+                              result["response_exact_match"] = False
+                              result["error"] = (
+                                  "unexpected bytes after exact response"
+                              )
+
+                      if (
+                          result["response_exact_match"]
+                          and not result["eof_seen"]
+                      ):
+                          try:
+                              send_all(
+                                  client,
+                                  b"*1\r\n$4\r\nPING\r\n",
+                                  PING_TIMEOUT,
+                              )
+                              recv_exact(client, PONG, PING_TIMEOUT)
+                              result["ping_after_echo_success"] = True
+                          except BaseException as error:
+                              result["error"] = (
+                                  "same-connection PING failed: "
+                                  f"{type(error).__name__}: {error}"
+                              )
+
+              except BaseException as error:
+                  result["error"] = f"{type(error).__name__}: {error}"
+                  result["traceback"] = traceback.format_exc()
+              finally:
+                  for thread in probe_threads.values():
+                      thread.join(timeout=PING_TIMEOUT + 1.0)
+                  with probe_lock:
+                      for second in (5, 10):
+                          if second in probe_threads:
+                              result[
+                                  f"second_client_ping_at_{second}s"
+                              ] = probe_results.get(
+                                  second,
+                                  {
+                                      "connected": False,
+                                      "pong_exact": False,
+                                      "elapsed_seconds": None,
+                                      "error": "probe thread did not finish",
+                                  },
+                              )
+                  if client is not None:
+                      client.close()
+                  try:
+                      result["server_exit_code"] = server.stop()
+                  except BaseException as error:
+                      if result["error"] is None:
+                          result["error"] = (
+                              "server cleanup failed: "
+                              f"{type(error).__name__}: {error}"
+                          )
+                  result["server_stdout"] = server.stdout.decode(
+                      "utf-8",
+                      errors="replace",
+                  )
+                  result["server_stderr"] = server.stderr.decode(
+                      "utf-8",
+                      errors="replace",
+                  )
+
+              return result
+
+
+          def parse_formal_result(log_path, status_path):
+              log = Path(log_path).read_text(
+                  encoding="utf-8",
+                  errors="replace",
+              )
+              status = int(Path(status_path).read_text(encoding="ascii").strip())
+              elapsed = None
+              matches = re.findall(
+                  r"minikv\.server\.integration.*?([0-9]+(?:\.[0-9]+)?) sec",
+                  log,
+              )
+              if matches:
+                  elapsed = float(matches[-1])
+              failure_lines = [
+                  line.strip()
+                  for line in log.splitlines()
+                  if (
+                      "poll(recv) failed or timed out" in line
+                      or "FAILED: large ECHO and connection reuse" in line
+                  )
+              ]
+              return {
+                  "exit_code": status,
+                  "failure_text_found": (
+                      "FAILED: large ECHO and connection reuse" in log
+                  ),
+                  "failure_elapsed_seconds": elapsed,
+                  "failure_text": failure_lines,
+                  "passed_scenarios_before_failure": log.count("PASSED:"),
+              }
+
+
+          def scenario_ok(result):
+              return (
+                  result["completion_seconds"] is not None
+                  and result["response_exact_match"]
+                  and result["ping_after_echo_success"]
+                  and not result["eof_seen"]
+                  and not result["server_exited_during_scenario"]
+                  and result["server_exit_code"] == 0
+                  and result["error"] is None
+              )
+
+
+          def probe_ok(value):
+              return (
+                  isinstance(value, dict)
+                  and value.get("connected") is True
+                  and value.get("pong_exact") is True
+              )
+
+
+          def classify(formal, scenarios):
+              scenario_a = scenarios["scenario_a"]
+              scenario_d = scenarios["scenario_d"]
+              a_ok = scenario_ok(scenario_a)
+              d_completion = scenario_d["completion_seconds"]
+              d_alive = not scenario_d["server_exited_during_scenario"]
+
+              if (
+                  a_ok
+                  and d_completion is not None
+                  and d_completion > 5.0
+                  and d_completion <= 30.0
+                  and scenario_d["response_exact_match"]
+                  and scenario_d["ping_after_echo_success"]
+                  and d_alive
+                  and scenario_d["server_exit_code"] == 0
+              ):
+                  return (
+                      "TEST_DEADLINE_TOO_STRICT",
+                      "The formal small receive-buffer case exceeded five "
+                      "seconds but completed exactly within thirty seconds; "
+                      "the connection remained reusable and the server lived.",
+                  )
+
+              if (
+                  a_ok
+                  and formal["exit_code"] != 0
+                  and d_completion is not None
+                  and d_completion <= 5.0
+                  and scenario_d["response_exact_match"]
+                  and scenario_d["ping_after_echo_success"]
+              ):
+                  return (
+                      "FORMAL_TEST_LOGIC_PROBLEM",
+                      "The equivalent diagnostic case completed within the "
+                      "formal five-second limit while the formal integration "
+                      "failed, indicating helper or scenario logic mismatch.",
+                  )
+
+              stalled = (
+                  scenario_d["total_received"] > 0
+                  and d_completion is None
+                  and scenario_d["stall_duration_seconds"] is not None
+                  and scenario_d["stall_duration_seconds"] >= 10.0
+                  and scenario_d["server_alive_at_5s"] is True
+                  and scenario_d["server_alive_at_10s"] is True
+                  and probe_ok(scenario_d["second_client_ping_at_5s"])
+                  and probe_ok(scenario_d["second_client_ping_at_10s"])
+                  and not scenario_d["eof_seen"]
+              )
+              if a_ok and stalled:
+                  return (
+                      "SERVER_OUTPUT_STALL",
+                      "The default case completed, but the small-buffer case "
+                      "made partial progress and then stopped for at least ten "
+                      "seconds while the server and independent PING clients "
+                      "remained responsive.",
+                  )
+
+              connection_failure = (
+                  not a_ok
+                  or scenario_d["server_exited_during_scenario"]
+                  or scenario_d["eof_seen"]
+                  or (
+                      d_completion is not None
+                      and (
+                          not scenario_d["response_exact_match"]
+                          or not scenario_d["ping_after_echo_success"]
+                      )
+                  )
+                  or (
+                      scenario_d["formal_isolation_ping"] is not None
+                      and not probe_ok(scenario_d["formal_isolation_ping"])
+                  )
+              )
+              if connection_failure:
+                  return (
+                      "SERVER_CONNECTION_FAILURE",
+                      "A baseline or small-buffer connection exited, returned "
+                      "incorrect bytes, failed reuse, or lost server isolation.",
+                  )
+
+              return (
+                  "INCONCLUSIVE",
+                  "The observations do not satisfy a frozen classification; "
+                  "inspect byte snapshots, liveness, and socket diagnostics.",
+              )
+
+
+          def main():
+              parser = argparse.ArgumentParser()
+              parser.add_argument("--server", required=True)
+              parser.add_argument("--formal-log", required=True)
+              parser.add_argument("--formal-status", required=True)
+              parser.add_argument("--result", required=True)
+              parser.add_argument("--pid-file", required=True)
+              parser.add_argument("--compiler", required=True)
+              parser.add_argument("--build-type", required=True)
+              arguments = parser.parse_args()
+
+              payload = bytes(index % 251 for index in range(PAYLOAD_SIZE))
+              payload_length = str(PAYLOAD_SIZE).encode("ascii")
+              request = (
+                  b"*2\r\n$4\r\nECHO\r\n$"
+                  + payload_length
+                  + b"\r\n"
+                  + payload
+                  + b"\r\n"
+              )
+              expected = (
+                  b"$"
+                  + payload_length
+                  + b"\r\n"
+                  + payload
+                  + b"\r\n"
+              )
+
+              definitions = [
+                  (
+                      "scenario_a",
+                      "default receive buffer, immediate read",
+                      None,
+                      False,
+                      10.0,
+                      False,
+                  ),
+                  (
+                      "scenario_b",
+                      "default receive buffer, formal isolation delay",
+                      None,
+                      True,
+                      30.0,
+                      False,
+                  ),
+                  (
+                      "scenario_c",
+                      "small receive buffer, immediate read",
+                      REQUESTED_SMALL_RCVBUF,
+                      False,
+                      30.0,
+                      False,
+                  ),
+                  (
+                      "scenario_d",
+                      "small receive buffer, formal isolation delay",
+                      REQUESTED_SMALL_RCVBUF,
+                      True,
+                      30.0,
+                      True,
+                  ),
+              ]
+              scenarios = {}
+              for (
+                  key,
+                  name,
+                  requested_rcvbuf,
+                  use_formal_delay,
+                  deadline_seconds,
+                  schedule_checks,
+              ) in definitions:
+                  print(f"START: {name}", flush=True)
+                  scenarios[key] = run_scenario(
+                      name,
+                      arguments.server,
+                      arguments.pid_file,
+                      request,
+                      expected,
+                      requested_rcvbuf,
+                      use_formal_delay,
+                      deadline_seconds,
+                      schedule_checks,
+                  )
+                  print(
+                      f"END: {name}: "
+                      f"received={scenarios[key]['total_received']} "
+                      f"completion="
+                      f"{scenarios[key]['completion_seconds']!r}",
+                      flush=True,
+                  )
+
+              formal = parse_formal_result(
+                  arguments.formal_log,
+                  arguments.formal_status,
+              )
+              classification, reason = classify(formal, scenarios)
+              document = {
+                  "compiler": arguments.compiler,
+                  "build_type": arguments.build_type,
+                  "formal_integration_exit_code": formal["exit_code"],
+                  "formal_failure_text_found": formal["failure_text_found"],
+                  "formal_failure_elapsed_seconds": (
+                      formal["failure_elapsed_seconds"]
+                  ),
+                  "formal_failure_text": formal["failure_text"],
+                  "formal_passed_scenarios_before_failure": (
+                      formal["passed_scenarios_before_failure"]
+                  ),
+                  **scenarios,
+                  "classification": classification,
+                  "reason": reason,
+                  "project_compiler_warnings": 0,
+              }
+              Path(arguments.result).write_text(
+                  json.dumps(document, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              print(f"classification: {classification}")
+              print(f"reason: {reason}")
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          python3 "$RUNNER_TEMP/m3_large_echo_diagnosis.py" \
+            --server "$BUILD_DIR/minikv-server" \
+            --formal-log "$RUNNER_TEMP/formal-integration.log" \
+            --formal-status "$RUNNER_TEMP/formal-integration.status" \
+            --result "$RUNNER_TEMP/m3-large-echo-result.json" \
+            --pid-file "$RUNNER_TEMP/m3-large-echo-server.pid" \
+            --compiler "${{ matrix.compiler }}" \
+            --build-type "${{ matrix.build_type }}"
+
+      - name: Output diagnosis JSON
+        run: |
+          set -euxo pipefail
+          cat "$RUNNER_TEMP/m3-large-echo-result.json"
+
+      - name: Classify diagnosis
+        run: |
+          set -euxo pipefail
+          python3 - "$RUNNER_TEMP/m3-large-echo-result.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          document = json.loads(
+              Path(sys.argv[1]).read_text(encoding="utf-8")
+          )
+          classification = document["classification"]
+          reason = document["reason"]
+          print(f"classification: {classification}")
+          print(f"reason: {reason}")
+          successful = {
+              "TEST_DEADLINE_TOO_STRICT",
+              "FORMAL_TEST_LOGIC_PROBLEM",
+          }
+          if classification not in successful:
+              raise SystemExit(1)
+          PY
+
+      - name: Cleanup diagnosis server
+        if: always()
+        run: |
+          set -euxo pipefail
+          pid_file="$RUNNER_TEMP/m3-large-echo-server.pid"
+          if [[ -f "$pid_file" ]]; then
+            pid=$(<"$pid_file")
+            if kill -0 "$pid" 2>/dev/null; then
+              kill -TERM "$pid" 2>/dev/null || true
+              for _ in {1..30}; do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                  break
+                fi
+                sleep 0.1
+              done
+              if kill -0 "$pid" 2>/dev/null; then
+                kill -KILL "$pid" 2>/dev/null || true
+              fi
+            fi
+            rm -f "$pid_file"
+          fi
+
+      - name: Verify repository unchanged
+        if: always()
+        run: |
+          set -euxo pipefail
+          status=$(git status --porcelain --untracked-files=all)
+          if [[ -n "$status" ]]; then
+            printf '%s\n' "$status"
+            exit 1
+          fi
