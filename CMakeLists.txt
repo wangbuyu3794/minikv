@@ -14,6 +14,19 @@ function(minikv_enable_warnings target)
     endif()
 endfunction()
 
+add_library(minikv_resp2 STATIC
+    src/resp2_parser.c
+)
+
+minikv_enable_warnings(minikv_resp2)
+
+if(BUILD_TESTING)
+    target_compile_definitions(minikv_resp2
+        PRIVATE
+            MINIKV_RESP2_TESTING
+    )
+endif()
+
 add_library(minikv_core STATIC
     src/version.c
 )
