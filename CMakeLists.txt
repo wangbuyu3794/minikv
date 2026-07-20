@@ -72,6 +72,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         PRIVATE
             _GNU_SOURCE
     )
+
+    target_link_libraries(minikv_server_runtime
+        PRIVATE
+            minikv_command
+            minikv_resp2
+    )
+
+    if(BUILD_TESTING)
+        target_compile_definitions(minikv_server_runtime
+            PRIVATE
+                MINIKV_SERVER_TESTING
+        )
+    endif()
 endif()
 
 minikv_enable_warnings(minikv_server_runtime)
@@ -171,6 +184,11 @@ if(BUILD_TESTING)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(minikv_server_linux_test
             tests/server_linux_test.c
+        )
+
+        target_compile_definitions(minikv_server_linux_test
+            PRIVATE
+                MINIKV_SERVER_TESTING
         )
 
         target_include_directories(minikv_server_linux_test
