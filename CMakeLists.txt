@@ -14,8 +14,11 @@ function(minikv_enable_warnings target)
     endif()
 endfunction()
 
+include(CTest)
+
 add_library(minikv_resp2 STATIC
     src/resp2_parser.c
+    src/resp2_encoder.c
 )
 
 minikv_enable_warnings(minikv_resp2)
@@ -78,8 +81,6 @@ target_link_libraries(minikv-server
 )
 
 minikv_enable_warnings(minikv-server)
-
-include(CTest)
 
 if(BUILD_TESTING)
     add_executable(minikv_resp2_parser_test
