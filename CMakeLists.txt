@@ -30,6 +30,17 @@ if(BUILD_TESTING)
     )
 endif()
 
+add_library(minikv_command STATIC
+    src/command.c
+)
+
+target_link_libraries(minikv_command
+    PUBLIC
+        minikv_resp2
+)
+
+minikv_enable_warnings(minikv_command)
+
 add_library(minikv_core STATIC
     src/version.c
 )
