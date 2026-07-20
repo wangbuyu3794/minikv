@@ -1,0 +1,478 @@
+name: M3 Stabilized Tests Validation
+
+on:
+  push:
+    branches:
+      - validation/m3-stabilized-tests-linux
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            build_type: Debug
+          - compiler: gcc
+            build_type: Release
+          - compiler: clang
+            build_type: Debug
+          - compiler: clang
+            build_type: Release
+
+    env:
+      CC: ${{ matrix.compiler }}
+      M3_BUILD_TYPE: ${{ matrix.build_type }}
+      TEST_BUILD_DIR: build/m3-stabilized-${{ matrix.compiler }}-${{ matrix.build_type }}
+      PROD_BUILD_DIR: build/m3-production-${{ matrix.compiler }}-${{ matrix.build_type }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Environment information
+        run: |
+          set -euxo pipefail
+          uname -a
+          cat /etc/os-release
+          cmake --version
+          ctest --version
+          git --version
+          command -v "$CC"
+          "$CC" --version
+          python3 --version
+          printf 'Build type: %s\n' "$M3_BUILD_TYPE"
+
+      - name: Configure testing build
+        run: |
+          set -euxo pipefail
+          cmake -S . \
+            -B "$TEST_BUILD_DIR" \
+            -DCMAKE_BUILD_TYPE="$M3_BUILD_TYPE" \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            2>&1 | tee "$RUNNER_TEMP/testing-configure.log"
+
+      - name: Build testing targets
+        run: |
+          set -euxo pipefail
+          cmake --build "$TEST_BUILD_DIR" --parallel 2 \
+            2>&1 | tee "$RUNNER_TEMP/test-build.log"
+
+      - name: Verify testing compiler warnings
+        run: |
+          set -euxo pipefail
+          python3 - "$RUNNER_TEMP/test-build.log" <<'PY'
+          import sys
+          from pathlib import Path
+
+          lines = Path(sys.argv[1]).read_text(
+              encoding="utf-8",
+              errors="replace",
+          ).splitlines()
+          warnings = [
+              line for line in lines if "warning:" in line.lower()
+          ]
+          if warnings:
+              print("project compiler warnings:", file=sys.stderr)
+              for line in warnings:
+                  print(line, file=sys.stderr)
+              raise SystemExit(1)
+          print("testing project compiler warnings: 0")
+          PY
+
+      - name: List registered tests
+        run: |
+          set -euxo pipefail
+          ctest --test-dir "$TEST_BUILD_DIR" -N \
+            2>&1 | tee "$RUNNER_TEMP/ctest-list.log"
+          ctest --test-dir "$TEST_BUILD_DIR" --show-only=json-v1 \
+            > "$RUNNER_TEMP/ctest-tests.json"
+
+      - name: Verify CTest names and properties
+        run: |
+          set -euxo pipefail
+          python3 - \
+            "$RUNNER_TEMP/ctest-list.log" \
+            "$RUNNER_TEMP/ctest-tests.json" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          expected = {
+              "minikv.smoke",
+              "minikv.server.help",
+              "minikv.server.short-help",
+              "minikv.resp2.parser",
+              "minikv.resp2.encoder",
+              "minikv.command",
+              "minikv.server.linux",
+              "minikv.server.integration",
+          }
+          list_text = Path(sys.argv[1]).read_text(
+              encoding="utf-8",
+              errors="replace",
+          )
+          listed = re.findall(r"Test\s+#\d+:\s+(\S+)", list_text)
+          document = json.loads(
+              Path(sys.argv[2]).read_text(encoding="utf-8")
+          )
+          tests = document.get("tests", [])
+          names = [test.get("name") for test in tests]
+
+          if (
+              len(listed) != 8
+              or len(set(listed)) != 8
+              or set(listed) != expected
+          ):
+              raise SystemExit(
+                  f"unexpected ctest -N names: {sorted(listed)!r}"
+              )
+          if (
+              len(names) != 8
+              or len(set(names)) != 8
+              or set(names) != expected
+          ):
+              raise SystemExit(
+                  f"unexpected CTest JSON names: {sorted(names)!r}"
+              )
+
+          integration = next(
+              test
+              for test in tests
+              if test.get("name") == "minikv.server.integration"
+          )
+          properties = {
+              item.get("name"): item.get("value")
+              for item in integration.get("properties", [])
+          }
+          timeout = properties.get("TIMEOUT")
+          if timeout is None or float(timeout) != 60.0:
+              raise SystemExit(
+                  f"integration TIMEOUT is not 60: {timeout!r}"
+              )
+
+          print("registered CTest count: 8")
+          print("registered CTest names:", ", ".join(sorted(names)))
+          print("integration TIMEOUT: 60")
+          PY
+
+      - name: Run all eight tests
+        run: |
+          set -euxo pipefail
+          ctest --test-dir "$TEST_BUILD_DIR" \
+            --output-on-failure \
+            --no-tests=error \
+            --timeout 60 \
+            2>&1 | tee "$RUNNER_TEMP/ctest-all.log"
+
+      - name: Run integration test verbosely
+        run: |
+          set -euxo pipefail
+          ctest --test-dir "$TEST_BUILD_DIR" \
+            --verbose \
+            --no-tests=error \
+            -R '^minikv\.server\.integration$' \
+            2>&1 | tee "$RUNNER_TEMP/integration-verbose.log"
+
+      - name: Verify stabilized integration scenarios
+        run: |
+          set -euxo pipefail
+          python3 - "$RUNNER_TEMP/integration-verbose.log" <<'PY'
+          import sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text(
+              encoding="utf-8",
+              errors="replace",
+          )
+          ordered = [
+              "PASSED: backpressure client isolation",
+              "PASSED: large ECHO and connection reuse",
+              "PASSED: disconnect isolation",
+              "PASSED: shutdown with partial and unread large response",
+          ]
+          positions = [text.find(item) for item in ordered]
+          if any(position < 0 for position in positions):
+              raise SystemExit(
+                  f"missing integration PASS markers: {positions!r}"
+              )
+          if positions != sorted(positions) or len(set(positions)) != 4:
+              raise SystemExit(
+                  f"integration PASS markers out of order: {positions!r}"
+              )
+
+          forbidden = [
+              "poll(recv) failed or timed out: timeout",
+              "FAILED: large ECHO and connection reuse",
+          ]
+          present = [item for item in forbidden if item in text]
+          if present:
+              raise SystemExit(
+                  f"unexpected integration failure markers: {present!r}"
+              )
+
+          print("backpressure client isolation: passed")
+          print("large ECHO and connection reuse: passed")
+          print("disconnect isolation after large ECHO: passed")
+          print("shutdown cleanup after large ECHO: passed")
+          PY
+
+      - name: Run Linux lifecycle test verbosely
+        run: |
+          set -euxo pipefail
+          ctest --test-dir "$TEST_BUILD_DIR" \
+            --verbose \
+            --no-tests=error \
+            -R '^minikv\.server\.linux$' \
+            2>&1 | tee "$RUNNER_TEMP/server-linux-verbose.log"
+
+      - name: Verify Linux lifecycle coverage
+        run: |
+          set -euxo pipefail
+          python3 - "$RUNNER_TEMP/server-linux-verbose.log" <<'PY'
+          import sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text(
+              encoding="utf-8",
+              errors="replace",
+          )
+          required = [
+              "PASSED: test hook arguments",
+              "PASSED: forced EAGAIN and connection reuse",
+              "PASSED: short writes and pipeline",
+              "PASSED: output limit boundaries",
+              "PASSED: destroy partial and pending connections",
+          ]
+          missing = [item for item in required if item not in text]
+          if missing:
+              raise SystemExit(
+                  f"missing lifecycle PASS markers: {missing!r}"
+              )
+          print("Linux lifecycle coverage markers: passed")
+          PY
+
+      - name: Verify testing target isolation
+        run: |
+          set -euxo pipefail
+          python3 - \
+            "$TEST_BUILD_DIR" \
+            "$TEST_BUILD_DIR/compile_commands.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          build_root = Path(sys.argv[1])
+          commands = json.loads(
+              Path(sys.argv[2]).read_text(encoding="utf-8")
+          )
+          executables = [
+              "minikv_resp2_encoder_test",
+              "minikv_command_test",
+              "minikv_resp2_parser_test",
+              "minikv_smoke",
+              "minikv_server_linux_test",
+              "minikv_server_integration_test",
+              "minikv-server",
+          ]
+          missing = [
+              name
+              for name in executables
+              if not (build_root / name).is_file()
+          ]
+          if missing:
+              raise SystemExit(
+                  f"missing testing executables: {missing!r}"
+              )
+
+          allowed_testing_macro_sources = {
+              "src/server_linux.c",
+              "tests/server_linux_test.c",
+          }
+          seen_testing_macro_sources = set()
+          for entry in commands:
+              source = Path(entry["file"]).as_posix()
+              command = entry.get("command")
+              if command is None:
+                  command = " ".join(entry["arguments"])
+              if "MINIKV_SERVER_TESTING" not in command:
+                  continue
+              matches = {
+                  suffix
+                  for suffix in allowed_testing_macro_sources
+                  if source.endswith(suffix)
+              }
+              if not matches:
+                  raise SystemExit(
+                      "testing macro on unexpected source: "
+                      f"{source}"
+                  )
+              seen_testing_macro_sources.update(matches)
+
+          if seen_testing_macro_sources != allowed_testing_macro_sources:
+              raise SystemExit(
+                  "testing macro source mismatch: "
+                  f"{sorted(seen_testing_macro_sources)!r}"
+              )
+
+          print("testing executables: present")
+          print(
+              "MINIKV_SERVER_TESTING sources:",
+              ", ".join(sorted(seen_testing_macro_sources)),
+          )
+          PY
+
+      - name: Run encoder unit test directly
+        run: |
+          set -euxo pipefail
+          ENCODER_TEST_EXE="$TEST_BUILD_DIR/minikv_resp2_encoder_test"
+          test -x "$ENCODER_TEST_EXE"
+          "$ENCODER_TEST_EXE" \
+            2>&1 | tee "$RUNNER_TEMP/encoder-direct.log"
+
+      - name: Run command unit test directly
+        run: |
+          set -euxo pipefail
+          COMMAND_TEST_EXE="$TEST_BUILD_DIR/minikv_command_test"
+          test -x "$COMMAND_TEST_EXE"
+          "$COMMAND_TEST_EXE" \
+            2>&1 | tee "$RUNNER_TEMP/command-direct.log"
+
+      - name: Configure production build
+        run: |
+          set -euxo pipefail
+          cmake -S . \
+            -B "$PROD_BUILD_DIR" \
+            -DCMAKE_BUILD_TYPE="$M3_BUILD_TYPE" \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            2>&1 | tee "$RUNNER_TEMP/production-configure.log"
+
+      - name: Build production targets
+        run: |
+          set -euxo pipefail
+          cmake --build "$PROD_BUILD_DIR" --parallel 2 \
+            2>&1 | tee "$RUNNER_TEMP/production-build.log"
+
+      - name: List production tests
+        run: |
+          set -euxo pipefail
+          ctest --test-dir "$PROD_BUILD_DIR" -N \
+            2>&1 | tee "$RUNNER_TEMP/production-ctest-list.log"
+          ctest --test-dir "$PROD_BUILD_DIR" --show-only=json-v1 \
+            > "$RUNNER_TEMP/production-tests.json"
+
+      - name: Verify production isolation
+        run: |
+          set -euxo pipefail
+          python3 - \
+            "$PROD_BUILD_DIR" \
+            "$RUNNER_TEMP/production-build.log" \
+            "$RUNNER_TEMP/production-ctest-list.log" \
+            "$RUNNER_TEMP/production-tests.json" \
+            "$PROD_BUILD_DIR/compile_commands.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          build_root = Path(sys.argv[1])
+          build_log = Path(sys.argv[2]).read_text(
+              encoding="utf-8",
+              errors="replace",
+          )
+          list_text = Path(sys.argv[3]).read_text(
+              encoding="utf-8",
+              errors="replace",
+          )
+          tests = json.loads(
+              Path(sys.argv[4]).read_text(encoding="utf-8")
+          ).get("tests", [])
+          commands_text = Path(sys.argv[5]).read_text(encoding="utf-8")
+
+          warnings = [
+              line
+              for line in build_log.splitlines()
+              if "warning:" in line.lower()
+          ]
+          if warnings:
+              print("production compiler warnings:", file=sys.stderr)
+              for line in warnings:
+                  print(line, file=sys.stderr)
+              raise SystemExit(1)
+          if tests:
+              raise SystemExit(
+                  f"production unexpectedly registered tests: {tests!r}"
+              )
+          if "Total Tests: 0" not in list_text:
+              raise SystemExit(
+                  "production ctest -N did not report Total Tests: 0"
+              )
+          if "MINIKV_SERVER_TESTING" in commands_text:
+              raise SystemExit(
+                  "production compile commands contain "
+                  "MINIKV_SERVER_TESTING"
+              )
+
+          forbidden = {
+              "minikv_resp2_encoder_test",
+              "minikv_command_test",
+              "minikv_resp2_parser_test",
+              "minikv_smoke",
+              "minikv_server_linux_test",
+              "minikv_server_integration_test",
+          }
+          generated = {
+              path.name
+              for path in build_root.rglob("*")
+              if path.is_file()
+          }
+          unexpected = sorted(forbidden & generated)
+          if unexpected:
+              raise SystemExit(
+                  f"production test executables exist: {unexpected!r}"
+              )
+
+          server = build_root / "minikv-server"
+          if not server.is_file():
+              raise SystemExit("production minikv-server is missing")
+
+          print("production project compiler warnings: 0")
+          print("production CTest count: 0")
+          print("production test executables: absent")
+          print("production MINIKV_SERVER_TESTING: absent")
+          print("production minikv-server: present")
+          PY
+
+      - name: Run production server help
+        run: |
+          set -euxo pipefail
+          PROD_SERVER_EXE="$PROD_BUILD_DIR/minikv-server"
+          test -x "$PROD_SERVER_EXE"
+          "$PROD_SERVER_EXE" --help \
+            2>&1 | tee "$RUNNER_TEMP/production-help.log"
+          "$PROD_SERVER_EXE" -h \
+            2>&1 | tee "$RUNNER_TEMP/production-short-help.log"
+          grep -F "Usage: minikv-server" \
+            "$RUNNER_TEMP/production-help.log"
+          grep -F "Usage: minikv-server" \
+            "$RUNNER_TEMP/production-short-help.log"
+
+      - name: Verify repository unchanged
+        run: |
+          set -euxo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --short)"
+          git diff --check
+          git diff --exit-code
