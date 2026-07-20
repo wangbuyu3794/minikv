@@ -1637,6 +1637,21 @@ static int test_runtime(char *executable)
         goto cleanup;
     }
 
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            large_request,
+            large_request_length,
+            IO_TIMEOUT_MS) < 0) {
+        goto cleanup;
+    }
+
     if (expect_bytes(first_fd, large_reply, large_reply_length) < 0 ||
         send_with_timeout(
             first_fd,
