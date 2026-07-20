@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -22,7 +23,7 @@
 #define CHILD_TIMEOUT_MS 3000
 #define KILL_TIMEOUT_MS 2000
 #define READINESS_TIMEOUT_MS 5000
-#define IO_TIMEOUT_MS 2000
+#define IO_TIMEOUT_MS 5000
 #define READINESS_CAPACITY 128U
 
 struct child_process {
@@ -656,9 +657,467 @@ static int send_with_timeout(
     return 0;
 }
 
+static void dump_available_pipe(const char *label, int fd)
+{
+    unsigned char buffer[512];
+
+    if (fd < 0) {
+        return;
+    }
+
+    fprintf(stderr, "----- %s -----\n", label);
+
+    for (;;) {
+        ssize_t received = read(fd, buffer, sizeof(buffer));
+
+        if (received > 0) {
+            (void) fwrite(buffer, 1U, (size_t) received, stderr);
+            continue;
+        }
+
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (received < 0 &&
+            (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        }
+
+        break;
+    }
+
+    fputc('\n', stderr);
+}
+
+static int recv_exact_with_timeout(
+    int fd,
+    unsigned char *buffer,
+    size_t length,
+    int timeout_ms)
+{
+    struct timespec deadline;
+    size_t offset = 0U;
+
+    if (make_deadline(&deadline, timeout_ms) < 0) {
+        return -1;
+    }
+
+    while (offset < length) {
+        ssize_t received = recv(fd, buffer + offset, length - offset, 0);
+
+        if (received > 0) {
+            offset += (size_t) received;
+            continue;
+        }
+
+        if (received == 0) {
+            fprintf(stderr,
+                    "unexpected EOF with %zu response bytes missing\n",
+                    length - offset);
+            return -1;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            struct pollfd descriptor;
+            int remaining = remaining_timeout_ms(&deadline);
+            int poll_result;
+
+            if (remaining <= 0) {
+                fprintf(stderr, "timed out receiving response\n");
+                return -1;
+            }
+
+            descriptor.fd = fd;
+            descriptor.events = POLLIN;
+            descriptor.revents = 0;
+            poll_result = poll(&descriptor, 1U, remaining);
+
+            if (poll_result < 0 && errno == EINTR) {
+                continue;
+            }
+
+            if (poll_result <= 0) {
+                fprintf(stderr, "poll(recv) failed or timed out: %s\n",
+                        poll_result == 0 ? "timeout" : strerror(errno));
+                return -1;
+            }
+
+            continue;
+        }
+
+        fprintf(stderr, "recv(client) failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
+
+static int expect_bytes(
+    int fd,
+    const unsigned char *expected,
+    size_t expected_length)
+{
+    unsigned char stack_buffer[512];
+    unsigned char *actual = stack_buffer;
+    int status = -1;
+
+    if (expected_length > sizeof(stack_buffer)) {
+        actual = malloc(expected_length);
+
+        if (actual == NULL) {
+            fprintf(stderr, "response comparison allocation failed\n");
+            return -1;
+        }
+    }
+
+    if (recv_exact_with_timeout(
+            fd,
+            actual,
+            expected_length,
+            IO_TIMEOUT_MS) == 0 &&
+        memcmp(actual, expected, expected_length) == 0) {
+        status = 0;
+    } else if (status != 0) {
+        fprintf(stderr, "response bytes did not match expected value\n");
+    }
+
+    if (actual != stack_buffer) {
+        free(actual);
+    }
+
+    return status;
+}
+
+static int expect_eof(int fd)
+{
+    struct timespec deadline;
+    unsigned char buffer[64];
+
+    if (make_deadline(&deadline, IO_TIMEOUT_MS) < 0) {
+        return -1;
+    }
+
+    for (;;) {
+        ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
+
+        if (received == 0) {
+            return 0;
+        }
+
+        if (received > 0) {
+            fprintf(stderr,
+                    "received %zd unexpected bytes before EOF\n",
+                    received);
+            return -1;
+        }
+
+        if (errno == EINTR) {
+            continue;
+        }
+
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            struct pollfd descriptor;
+            int remaining = remaining_timeout_ms(&deadline);
+            int poll_result;
+
+            if (remaining <= 0) {
+                fprintf(stderr, "timed out waiting for EOF\n");
+                return -1;
+            }
+
+            descriptor.fd = fd;
+            descriptor.events = POLLIN | POLLHUP;
+            descriptor.revents = 0;
+            poll_result = poll(&descriptor, 1U, remaining);
+
+            if (poll_result < 0 && errno == EINTR) {
+                continue;
+            }
+
+            if (poll_result <= 0) {
+                fprintf(stderr, "poll(EOF) failed or timed out: %s\n",
+                        poll_result == 0 ? "timeout" : strerror(errno));
+                return -1;
+            }
+
+            continue;
+        }
+
+        fprintf(stderr, "recv(EOF) failed: %s\n", strerror(errno));
+        return -1;
+    }
+}
+
+static int exchange(
+    uint16_t port,
+    const unsigned char *request,
+    size_t request_length,
+    const unsigned char *expected,
+    size_t expected_length)
+{
+    int client_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+    int status = -1;
+
+    if (client_fd < 0 ||
+        send_with_timeout(
+            client_fd,
+            request,
+            request_length,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(client_fd, expected, expected_length) < 0) {
+        goto cleanup;
+    }
+
+    status = 0;
+
+cleanup:
+    if (close_owned_fd(&client_fd) < 0) {
+        status = -1;
+    }
+
+    return status;
+}
+
+static int exchange_then_eof(
+    uint16_t port,
+    const unsigned char *request,
+    size_t request_length,
+    const unsigned char *expected,
+    size_t expected_length)
+{
+    int client_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+    int status = -1;
+
+    if (client_fd < 0 ||
+        send_with_timeout(
+            client_fd,
+            request,
+            request_length,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(client_fd, expected, expected_length) < 0 ||
+        expect_eof(client_fd) < 0) {
+        goto cleanup;
+    }
+
+    status = 0;
+
+cleanup:
+    if (close_owned_fd(&client_fd) < 0) {
+        status = -1;
+    }
+
+    return status;
+}
+
+static int fragmented_exchange(
+    uint16_t port,
+    const unsigned char *request,
+    size_t request_length,
+    const size_t *parts,
+    size_t part_count,
+    const unsigned char *expected,
+    size_t expected_length)
+{
+    int client_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+    size_t offset = 0U;
+    size_t index;
+    int status = -1;
+
+    if (client_fd < 0) {
+        goto cleanup;
+    }
+
+    for (index = 0U; index < part_count; index++) {
+        if (parts[index] > request_length - offset ||
+            send_with_timeout(
+                client_fd,
+                request + offset,
+                parts[index],
+                IO_TIMEOUT_MS) < 0) {
+            goto cleanup;
+        }
+
+        offset += parts[index];
+    }
+
+    if (offset != request_length ||
+        expect_bytes(client_fd, expected, expected_length) < 0) {
+        goto cleanup;
+    }
+
+    status = 0;
+
+cleanup:
+    if (close_owned_fd(&client_fd) < 0) {
+        status = -1;
+    }
+
+    return status;
+}
+
+static int make_echo_request(
+    const unsigned char *payload,
+    size_t payload_length,
+    unsigned char **out_request,
+    size_t *out_length)
+{
+    char header[96];
+    int header_length;
+    size_t total;
+    unsigned char *request;
+
+    *out_request = NULL;
+    *out_length = 0U;
+    header_length = snprintf(
+        header,
+        sizeof(header),
+        "*2\r\n$4\r\nECHO\r\n$%zu\r\n",
+        payload_length);
+
+    if (header_length < 0 ||
+        (size_t) header_length >= sizeof(header) ||
+        payload_length > SIZE_MAX - (size_t) header_length - 2U) {
+        return -1;
+    }
+
+    total = (size_t) header_length + payload_length + 2U;
+    request = malloc(total);
+
+    if (request == NULL) {
+        return -1;
+    }
+
+    memcpy(request, header, (size_t) header_length);
+
+    if (payload_length > 0U) {
+        memcpy(request + (size_t) header_length, payload, payload_length);
+    }
+
+    request[total - 2U] = (unsigned char) '\r';
+    request[total - 1U] = (unsigned char) '\n';
+    *out_request = request;
+    *out_length = total;
+    return 0;
+}
+
+static int make_bulk_reply(
+    const unsigned char *payload,
+    size_t payload_length,
+    unsigned char **out_reply,
+    size_t *out_length)
+{
+    char header[64];
+    int header_length;
+    size_t total;
+    unsigned char *reply;
+
+    *out_reply = NULL;
+    *out_length = 0U;
+    header_length = snprintf(
+        header,
+        sizeof(header),
+        "$%zu\r\n",
+        payload_length);
+
+    if (header_length < 0 ||
+        (size_t) header_length >= sizeof(header) ||
+        payload_length > SIZE_MAX - (size_t) header_length - 2U) {
+        return -1;
+    }
+
+    total = (size_t) header_length + payload_length + 2U;
+    reply = malloc(total);
+
+    if (reply == NULL) {
+        return -1;
+    }
+
+    memcpy(reply, header, (size_t) header_length);
+
+    if (payload_length > 0U) {
+        memcpy(reply + (size_t) header_length, payload, payload_length);
+    }
+
+    reply[total - 2U] = (unsigned char) '\r';
+    reply[total - 1U] = (unsigned char) '\n';
+    *out_reply = reply;
+    *out_length = total;
+    return 0;
+}
+
 static int test_runtime(char *executable)
 {
-    static const char payload[] = "MiniKV M1 integration test";
+    static const unsigned char ping[] =
+        "*1\r\n$4\r\nPING\r\n";
+    static const unsigned char ping_lower[] =
+        "*1\r\n$4\r\nping\r\n";
+    static const unsigned char ping_mixed[] =
+        "*1\r\n$4\r\nPiNg\r\n";
+    static const unsigned char pong[] = "+PONG\r\n";
+    static const unsigned char ping_message[] =
+        "*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n";
+    static const unsigned char echo_normal[] =
+        "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n";
+    static const unsigned char echo_lower[] =
+        "*2\r\n$4\r\necho\r\n$1\r\nx\r\n";
+    static const unsigned char echo_mixed[] =
+        "*2\r\n$4\r\nEcHo\r\n$1\r\ny\r\n";
+    static const unsigned char echo_empty[] =
+        "*2\r\n$4\r\nECHO\r\n$0\r\n\r\n";
+    static const unsigned char hello_reply[] = "$5\r\nhello\r\n";
+    static const unsigned char empty_reply[] = "$0\r\n\r\n";
+    static const unsigned char binary_request[] = {
+        '*', '2', '\r', '\n',
+        '$', '4', '\r', '\n', 'E', 'C', 'H', 'O', '\r', '\n',
+        '$', '5', '\r', '\n', 0x00, '\r', '\n', '\r', '\n',
+        '\r', '\n'
+    };
+    static const unsigned char binary_reply[] = {
+        '$', '5', '\r', '\n', 0x00, '\r', '\n', '\r', '\n',
+        '\r', '\n'
+    };
+    static const unsigned char pipeline[] =
+        "*1\r\n$4\r\nPING\r\n"
+        "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n"
+        "*1\r\n$3\r\nGET\r\n"
+        "*2\r\n$4\r\nPING\r\n$5\r\nworld\r\n";
+    static const unsigned char pipeline_reply[] =
+        "+PONG\r\n"
+        "$5\r\nhello\r\n"
+        "-ERR unknown command\r\n"
+        "$5\r\nworld\r\n";
+    static const unsigned char unknown_request[] =
+        "*1\r\n$3\r\nGET\r\n";
+    static const unsigned char unknown_reply[] =
+        "-ERR unknown command\r\n";
+    static const unsigned char ping_arity_request[] =
+        "*3\r\n$4\r\nPING\r\n$1\r\na\r\n$1\r\nb\r\n";
+    static const unsigned char ping_arity_reply[] =
+        "-ERR wrong number of arguments for 'ping' command\r\n";
+    static const unsigned char echo_arity_request[] =
+        "*1\r\n$4\r\nECHO\r\n";
+    static const unsigned char echo_arity_reply[] =
+        "-ERR wrong number of arguments for 'echo' command\r\n";
+    static const unsigned char protocol_error[] =
+        "-ERR Protocol error\r\n";
+    static const unsigned char malformed[] = "?\r\n";
+    static const unsigned char bulk_shape[] = "$4\r\nPING\r\n";
+    static const unsigned char nested_shape[] =
+        "*2\r\n$4\r\nPING\r\n*0\r\n";
+    static const unsigned char non_bulk_shape[] =
+        "*2\r\n$4\r\nPING\r\n+arg\r\n";
+    static const unsigned char null_bulk_shape[] =
+        "*2\r\n$4\r\nPING\r\n$-1\r\n";
+    static const unsigned char partial[] = "*1\r\n$4\r\nPI";
+    static const size_t ping_header_parts[] = {1U, 3U, 10U};
+    static const size_t bulk_length_parts[] = {14U, 1U, 1U, 9U};
+    static const size_t payload_parts[] = {18U, 2U, 3U, 2U};
+    static const size_t trailing_parts[] = {23U, 1U, 1U};
     struct child_process child;
     char readiness[READINESS_CAPACITY];
     char *arguments[] = {
@@ -669,11 +1128,30 @@ static int test_runtime(char *executable)
         "0",
         NULL
     };
+    unsigned char *large_payload = NULL;
+    unsigned char *large_request = NULL;
+    unsigned char *large_reply = NULL;
+    size_t large_request_length = 0U;
+    size_t large_reply_length = 0U;
+    size_t byte_parts[sizeof(ping) - 1U];
+    size_t index;
     uint16_t port;
-    int client_fd = -1;
+    int first_fd = -1;
+    int second_fd = -1;
+    int partial_fd = -1;
+    int pending_fd = -1;
     int child_status = 0;
     int wait_result;
     int result = 1;
+
+#define RUN_SCENARIO(name, expression)                                   \
+    do {                                                                  \
+        if ((expression) < 0) {                                           \
+            fprintf(stderr, "FAILED: %s\n", (name));                      \
+            goto cleanup;                                                 \
+        }                                                                 \
+        printf("PASSED: %s\n", (name));                                   \
+    } while (0)
 
     child_process_init(&child);
 
@@ -694,21 +1172,541 @@ static int test_runtime(char *executable)
         goto cleanup;
     }
 
-    client_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+    RUN_SCENARIO(
+        "PING",
+        exchange(
+            port,
+            ping,
+            sizeof(ping) - 1U,
+            pong,
+            sizeof(pong) - 1U));
+    RUN_SCENARIO(
+        "lowercase PING",
+        exchange(
+            port,
+            ping_lower,
+            sizeof(ping_lower) - 1U,
+            pong,
+            sizeof(pong) - 1U));
+    RUN_SCENARIO(
+        "mixed-case PING",
+        exchange(
+            port,
+            ping_mixed,
+            sizeof(ping_mixed) - 1U,
+            pong,
+            sizeof(pong) - 1U));
+    RUN_SCENARIO(
+        "PING message",
+        exchange(
+            port,
+            ping_message,
+            sizeof(ping_message) - 1U,
+            hello_reply,
+            sizeof(hello_reply) - 1U));
+    RUN_SCENARIO(
+        "ECHO normal",
+        exchange(
+            port,
+            echo_normal,
+            sizeof(echo_normal) - 1U,
+            hello_reply,
+            sizeof(hello_reply) - 1U));
+    RUN_SCENARIO(
+        "lowercase ECHO",
+        exchange(
+            port,
+            echo_lower,
+            sizeof(echo_lower) - 1U,
+            (const unsigned char *) "$1\r\nx\r\n",
+            sizeof("$1\r\nx\r\n") - 1U));
+    RUN_SCENARIO(
+        "mixed-case ECHO",
+        exchange(
+            port,
+            echo_mixed,
+            sizeof(echo_mixed) - 1U,
+            (const unsigned char *) "$1\r\ny\r\n",
+            sizeof("$1\r\ny\r\n") - 1U));
+    RUN_SCENARIO(
+        "empty ECHO",
+        exchange(
+            port,
+            echo_empty,
+            sizeof(echo_empty) - 1U,
+            empty_reply,
+            sizeof(empty_reply) - 1U));
+    RUN_SCENARIO(
+        "binary ECHO",
+        exchange(
+            port,
+            binary_request,
+            sizeof(binary_request),
+            binary_reply,
+            sizeof(binary_reply)));
 
-    if (client_fd < 0) {
+    for (index = 0U; index < sizeof(byte_parts) / sizeof(byte_parts[0]);
+         index++) {
+        byte_parts[index] = 1U;
+    }
+
+    RUN_SCENARIO(
+        "bytewise request fragmentation",
+        fragmented_exchange(
+            port,
+            ping,
+            sizeof(ping) - 1U,
+            byte_parts,
+            sizeof(byte_parts) / sizeof(byte_parts[0]),
+            pong,
+            sizeof(pong) - 1U));
+    RUN_SCENARIO(
+        "header fragmentation",
+        fragmented_exchange(
+            port,
+            ping,
+            sizeof(ping) - 1U,
+            ping_header_parts,
+            sizeof(ping_header_parts) / sizeof(ping_header_parts[0]),
+            pong,
+            sizeof(pong) - 1U));
+    RUN_SCENARIO(
+        "bulk length fragmentation",
+        fragmented_exchange(
+            port,
+            echo_normal,
+            sizeof(echo_normal) - 1U,
+            bulk_length_parts,
+            sizeof(bulk_length_parts) / sizeof(bulk_length_parts[0]),
+            hello_reply,
+            sizeof(hello_reply) - 1U));
+    RUN_SCENARIO(
+        "payload fragmentation",
+        fragmented_exchange(
+            port,
+            echo_normal,
+            sizeof(echo_normal) - 1U,
+            payload_parts,
+            sizeof(payload_parts) / sizeof(payload_parts[0]),
+            hello_reply,
+            sizeof(hello_reply) - 1U));
+    RUN_SCENARIO(
+        "trailing CRLF fragmentation",
+        fragmented_exchange(
+            port,
+            echo_normal,
+            sizeof(echo_normal) - 1U,
+            trailing_parts,
+            sizeof(trailing_parts) / sizeof(trailing_parts[0]),
+            hello_reply,
+            sizeof(hello_reply) - 1U));
+    RUN_SCENARIO(
+        "single-write pipeline and response order",
+        exchange(
+            port,
+            pipeline,
+            sizeof(pipeline) - 1U,
+            pipeline_reply,
+            sizeof(pipeline_reply) - 1U));
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(first_fd, pong, sizeof(pong) - 1U) < 0 ||
+        send_with_timeout(
+            first_fd,
+            echo_normal,
+            sizeof(echo_normal) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(
+            first_fd,
+            hello_reply,
+            sizeof(hello_reply) - 1U) < 0 ||
+        send_with_timeout(
+            first_fd,
+            pipeline,
+            sizeof(pipeline) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(
+            first_fd,
+            pipeline_reply,
+            sizeof(pipeline_reply) - 1U) < 0) {
+        fprintf(stderr, "FAILED: multiple pipeline batches\n");
         goto cleanup;
     }
 
+    printf("PASSED: multiple pipeline batches\n");
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+    second_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 || second_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            partial,
+            sizeof(partial) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        send_with_timeout(
+            second_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(second_fd, pong, sizeof(pong) - 1U) < 0 ||
+        send_with_timeout(
+            first_fd,
+            (const unsigned char *) "NG\r\n",
+            sizeof("NG\r\n") - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(first_fd, pong, sizeof(pong) - 1U) < 0) {
+        fprintf(stderr, "FAILED: two-client parser isolation\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: two-client parser isolation\n");
+    if (close_owned_fd(&first_fd) < 0 ||
+        close_owned_fd(&second_fd) < 0) {
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            unknown_request,
+            sizeof(unknown_request) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(
+            first_fd,
+            unknown_reply,
+            sizeof(unknown_reply) - 1U) < 0 ||
+        send_with_timeout(
+            first_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(first_fd, pong, sizeof(pong) - 1U) < 0) {
+        fprintf(stderr, "FAILED: unknown then PING\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: unknown then PING\n");
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            ping_arity_request,
+            sizeof(ping_arity_request) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(
+            first_fd,
+            ping_arity_reply,
+            sizeof(ping_arity_reply) - 1U) < 0 ||
+        send_with_timeout(
+            first_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(first_fd, pong, sizeof(pong) - 1U) < 0) {
+        fprintf(stderr, "FAILED: PING wrong arity then PING\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: PING wrong arity then PING\n");
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            echo_arity_request,
+            sizeof(echo_arity_request) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(
+            first_fd,
+            echo_arity_reply,
+            sizeof(echo_arity_reply) - 1U) < 0 ||
+        send_with_timeout(
+            first_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(first_fd, pong, sizeof(pong) - 1U) < 0) {
+        fprintf(stderr, "FAILED: ECHO wrong arity then PING\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: ECHO wrong arity then PING\n");
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    RUN_SCENARIO(
+        "malformed RESP protocol error and EOF",
+        exchange_then_eof(
+            port,
+            malformed,
+            sizeof(malformed) - 1U,
+            protocol_error,
+            sizeof(protocol_error) - 1U));
+    RUN_SCENARIO(
+        "top-level Bulk protocol error and EOF",
+        exchange_then_eof(
+            port,
+            bulk_shape,
+            sizeof(bulk_shape) - 1U,
+            protocol_error,
+            sizeof(protocol_error) - 1U));
+    RUN_SCENARIO(
+        "nested element protocol error and EOF",
+        exchange_then_eof(
+            port,
+            nested_shape,
+            sizeof(nested_shape) - 1U,
+            protocol_error,
+            sizeof(protocol_error) - 1U));
+    RUN_SCENARIO(
+        "non-Bulk element protocol error and EOF",
+        exchange_then_eof(
+            port,
+            non_bulk_shape,
+            sizeof(non_bulk_shape) - 1U,
+            protocol_error,
+            sizeof(protocol_error) - 1U));
+    RUN_SCENARIO(
+        "null-Bulk element protocol error and EOF",
+        exchange_then_eof(
+            port,
+            null_bulk_shape,
+            sizeof(null_bulk_shape) - 1U,
+            protocol_error,
+            sizeof(protocol_error) - 1U));
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        send_with_timeout(
+            first_fd,
+            malformed,
+            sizeof(malformed) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(first_fd, pong, sizeof(pong) - 1U) < 0 ||
+        expect_bytes(
+            first_fd,
+            protocol_error,
+            sizeof(protocol_error) - 1U) < 0 ||
+        expect_eof(first_fd) < 0) {
+        fprintf(stderr, "FAILED: queued reply before protocol error\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: queued reply before protocol error\n");
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        shutdown(first_fd, SHUT_WR) < 0 ||
+        expect_bytes(first_fd, pong, sizeof(pong) - 1U) < 0 ||
+        expect_eof(first_fd) < 0) {
+        fprintf(stderr, "FAILED: complete request half-close\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: complete request half-close\n");
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            partial,
+            sizeof(partial) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        shutdown(first_fd, SHUT_WR) < 0 ||
+        expect_eof(first_fd) < 0) {
+        fprintf(stderr, "FAILED: incomplete request half-close\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: incomplete request half-close\n");
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    large_payload = malloc(1024U * 1024U);
+
+    if (large_payload == NULL) {
+        fprintf(stderr, "large payload allocation failed\n");
+        goto cleanup;
+    }
+
+    for (index = 0U; index < 1024U * 1024U; index++) {
+        large_payload[index] = (unsigned char) (index % 251U);
+    }
+
+    if (make_echo_request(
+            large_payload,
+            1024U * 1024U,
+            &large_request,
+            &large_request_length) < 0 ||
+        make_bulk_reply(
+            large_payload,
+            1024U * 1024U,
+            &large_reply,
+            &large_reply_length) < 0) {
+        fprintf(stderr, "large message construction failed\n");
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0) {
+        goto cleanup;
+    }
+
+    {
+        int receive_buffer = 1024;
+
+        if (setsockopt(
+                first_fd,
+                SOL_SOCKET,
+                SO_RCVBUF,
+                &receive_buffer,
+                sizeof(receive_buffer)) < 0) {
+            fprintf(stderr, "setsockopt(SO_RCVBUF) failed: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+    }
+
     if (send_with_timeout(
-            client_fd,
-            payload,
-            sizeof(payload) - 1U,
+            first_fd,
+            large_request,
+            large_request_length,
             IO_TIMEOUT_MS) < 0) {
         goto cleanup;
     }
 
-    if (close_owned_fd(&client_fd) < 0) {
+    second_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (second_fd < 0 ||
+        send_with_timeout(
+            second_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(second_fd, pong, sizeof(pong) - 1U) < 0) {
+        fprintf(stderr, "FAILED: backpressure client isolation\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: backpressure client isolation\n");
+    if (close_owned_fd(&second_fd) < 0) {
+        goto cleanup;
+    }
+
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 ||
+        send_with_timeout(
+            first_fd,
+            large_request,
+            large_request_length,
+            IO_TIMEOUT_MS) < 0) {
+        goto cleanup;
+    }
+
+    if (expect_bytes(first_fd, large_reply, large_reply_length) < 0 ||
+        send_with_timeout(
+            first_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(first_fd, pong, sizeof(pong) - 1U) < 0) {
+        fprintf(stderr, "FAILED: large ECHO and connection reuse\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: large ECHO and connection reuse\n");
+    if (close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    first_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (first_fd < 0 || close_owned_fd(&first_fd) < 0) {
+        goto cleanup;
+    }
+
+    second_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (second_fd < 0 ||
+        send_with_timeout(
+            second_fd,
+            ping,
+            sizeof(ping) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        expect_bytes(second_fd, pong, sizeof(pong) - 1U) < 0) {
+        fprintf(stderr, "FAILED: disconnect isolation\n");
+        goto cleanup;
+    }
+
+    printf("PASSED: disconnect isolation\n");
+    if (close_owned_fd(&second_fd) < 0) {
+        goto cleanup;
+    }
+
+    partial_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+    pending_fd = connect_with_timeout(port, IO_TIMEOUT_MS);
+
+    if (partial_fd < 0 || pending_fd < 0 ||
+        send_with_timeout(
+            partial_fd,
+            partial,
+            sizeof(partial) - 1U,
+            IO_TIMEOUT_MS) < 0 ||
+        send_with_timeout(
+            pending_fd,
+            large_request,
+            large_request_length,
+            IO_TIMEOUT_MS) < 0) {
+        fprintf(stderr, "FAILED: shutdown connection setup\n");
         goto cleanup;
     }
 
@@ -727,17 +1725,47 @@ static int test_runtime(char *executable)
         goto cleanup;
     }
 
+    printf("PASSED: shutdown with partial and unread large response\n");
     result = 0;
 
 cleanup:
-    if (close_owned_fd(&client_fd) < 0) {
+    if (close_owned_fd(&first_fd) < 0 ||
+        close_owned_fd(&second_fd) < 0 ||
+        close_owned_fd(&partial_fd) < 0 ||
+        close_owned_fd(&pending_fd) < 0) {
         result = 1;
+    }
+
+    free(large_payload);
+    free(large_request);
+    free(large_reply);
+
+    if (result != 0 && !child.reaped) {
+        int diagnostic_status = 0;
+
+        wait_result = terminate_child(
+            &child,
+            CHILD_TIMEOUT_MS,
+            &diagnostic_status);
+
+        if (wait_result != 0) {
+            (void) kill_and_reap_child(
+                &child,
+                KILL_TIMEOUT_MS,
+                &diagnostic_status);
+        }
+    }
+
+    if (result != 0) {
+        dump_available_pipe("server stdout", child.stdout_fd);
+        dump_available_pipe("server stderr", child.stderr_fd);
     }
 
     if (cleanup_child(&child) < 0) {
         result = 1;
     }
 
+#undef RUN_SCENARIO
     return result;
 }
 

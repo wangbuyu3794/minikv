@@ -19,7 +19,7 @@ static void print_help(void)
     printf("  --port <port>     Listen on port 0 through 65535.\n");
     printf("  -h, --help        Show this help message and exit.\n");
     printf("\n");
-    printf("M1 accepts TCP connections but does not implement a protocol.\n");
+    printf("On Linux, MiniKV supports RESP2 PING and ECHO only.\n");
 }
 
 static int parse_port(const char *text, uint16_t *port)

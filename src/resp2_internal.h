@@ -68,6 +68,20 @@ enum minikv_resp2_error {
     MINIKV_RESP2_ERROR_INVALID_STATE
 };
 
+enum minikv_resp2_encode_type {
+    MINIKV_RESP2_ENCODE_SIMPLE_STRING,
+    MINIKV_RESP2_ENCODE_SIMPLE_ERROR,
+    MINIKV_RESP2_ENCODE_BULK_STRING
+};
+
+enum minikv_resp2_encode_error {
+    MINIKV_RESP2_ENCODE_ERROR_NONE,
+    MINIKV_RESP2_ENCODE_ERROR_INVALID_ARGUMENT,
+    MINIKV_RESP2_ENCODE_ERROR_INVALID_PAYLOAD,
+    MINIKV_RESP2_ENCODE_ERROR_OVERFLOW,
+    MINIKV_RESP2_ENCODE_ERROR_BUFFER_TOO_SMALL
+};
+
 void minikv_resp2_limits_default(
     struct minikv_resp2_limits *limits);
 
@@ -93,6 +107,22 @@ void minikv_resp2_parser_destroy(
 
 void minikv_resp2_value_destroy(
     struct minikv_resp2_value *value);
+
+int minikv_resp2_encoded_size(
+    enum minikv_resp2_encode_type type,
+    const unsigned char *payload,
+    size_t payload_length,
+    size_t *out_size,
+    enum minikv_resp2_encode_error *out_error);
+
+int minikv_resp2_encode(
+    enum minikv_resp2_encode_type type,
+    const unsigned char *payload,
+    size_t payload_length,
+    unsigned char *destination,
+    size_t destination_size,
+    size_t *out_written,
+    enum minikv_resp2_encode_error *out_error);
 
 #ifdef MINIKV_RESP2_TESTING
 

@@ -342,6 +342,128 @@ static int send_all(int fd, const void *buffer, size_t length)
     return 0;
 }
 
+static int receive_exact_with_server(
+    struct minikv_server *server,
+    int fd,
+    const unsigned char *expected,
+    size_t expected_length)
+{
+    unsigned char buffer[256];
+    struct timespec deadline;
+    size_t received_total = 0U;
+
+    if (expected_length > sizeof(buffer) ||
+        make_deadline(&deadline, IO_TIMEOUT_MS) < 0) {
+        return -1;
+    }
+
+    while (received_total < expected_length) {
+        ssize_t received;
+        int remaining = remaining_timeout_ms(&deadline);
+        int poll_result;
+
+        if (remaining <= 0) {
+            fprintf(stderr, "timed out waiting for server response\n");
+            return -1;
+        }
+
+        poll_result = minikv_server_poll(
+            server,
+            remaining < 50 ? remaining : 50);
+
+        if (poll_result != MINIKV_POLL_CONTINUE) {
+            fprintf(stderr, "server poll returned %d\n", poll_result);
+            return -1;
+        }
+
+        received = recv(
+            fd,
+            buffer + received_total,
+            expected_length - received_total,
+            0);
+
+        if (received > 0) {
+            received_total += (size_t) received;
+            continue;
+        }
+
+        if (received == 0) {
+            fprintf(stderr, "unexpected EOF while receiving response\n");
+            return -1;
+        }
+
+        if (errno == EINTR ||
+            errno == EAGAIN ||
+            errno == EWOULDBLOCK) {
+            continue;
+        }
+
+        fprintf(stderr, "recv(client) failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (memcmp(buffer, expected, expected_length) != 0) {
+        fprintf(stderr, "server response bytes did not match\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int expect_eof_without_data(
+    struct minikv_server *server,
+    int fd)
+{
+    unsigned char buffer[64];
+    struct timespec deadline;
+
+    if (make_deadline(&deadline, IO_TIMEOUT_MS) < 0) {
+        return -1;
+    }
+
+    for (;;) {
+        ssize_t received;
+        int remaining = remaining_timeout_ms(&deadline);
+        int poll_result;
+
+        if (remaining <= 0) {
+            fprintf(stderr, "timed out waiting for client EOF\n");
+            return -1;
+        }
+
+        poll_result = minikv_server_poll(
+            server,
+            remaining < 50 ? remaining : 50);
+
+        if (poll_result != MINIKV_POLL_CONTINUE) {
+            fprintf(stderr, "server poll returned %d\n", poll_result);
+            return -1;
+        }
+
+        received = recv(fd, buffer, sizeof(buffer), 0);
+
+        if (received == 0) {
+            return 0;
+        }
+
+        if (received > 0) {
+            fprintf(stderr,
+                    "received %zd unexpected bytes before EOF\n",
+                    received);
+            return -1;
+        }
+
+        if (errno == EINTR ||
+            errno == EAGAIN ||
+            errno == EWOULDBLOCK) {
+            continue;
+        }
+
+        fprintf(stderr, "recv(client) failed: %s\n", strerror(errno));
+        return -1;
+    }
+}
+
 static int wait_for_connection_count(
     struct minikv_server *server,
     size_t expected_count,
@@ -647,13 +769,312 @@ cleanup:
     return result;
 }
 
+static int test_hook_arguments(void)
+{
+    const struct minikv_server_options options = {
+        "127.0.0.1",
+        0U
+    };
+    struct minikv_server *server = NULL;
+    int result = 1;
+
+    if (minikv_server_test_set_send_chunk_limit(NULL, 1U) != -1 ||
+        minikv_server_test_force_next_send_would_block(NULL) != -1 ||
+        minikv_server_test_set_output_limit(NULL, 1U) != -1) {
+        fprintf(stderr, "NULL server test hook unexpectedly succeeded\n");
+        goto cleanup;
+    }
+
+    if (minikv_server_create(&server, &options) < 0) {
+        fprintf(stderr, "minikv_server_create failed: %s\n", strerror(errno));
+        goto cleanup;
+    }
+
+    if (minikv_server_test_set_output_limit(server, 0U) != -1 ||
+        minikv_server_test_set_output_limit(server, 14U) != 0 ||
+        minikv_server_test_set_send_chunk_limit(server, 2U) != 0 ||
+        minikv_server_test_set_send_chunk_limit(server, 0U) != 0 ||
+        minikv_server_test_force_next_send_would_block(server) != 0) {
+        fprintf(stderr, "valid test hook arguments failed\n");
+        goto cleanup;
+    }
+
+    result = 0;
+
+cleanup:
+    minikv_server_destroy(server);
+    return result;
+}
+
+static int test_forced_eagain_and_connection_reuse(void)
+{
+    static const unsigned char ping[] =
+        "*1\r\n$4\r\nPING\r\n";
+    static const unsigned char pong[] = "+PONG\r\n";
+    const struct minikv_server_options options = {
+        "127.0.0.1",
+        0U
+    };
+    struct minikv_server *server = NULL;
+    int client_fd = -1;
+    int result = 1;
+
+    if (minikv_server_create(&server, &options) < 0 ||
+        minikv_server_test_set_send_chunk_limit(server, 2U) != 0) {
+        fprintf(stderr, "server setup failed\n");
+        goto cleanup;
+    }
+
+    client_fd = connect_client(minikv_server_bound_port(server));
+
+    if (client_fd < 0 ||
+        wait_for_connection_count(server, 1U, IO_TIMEOUT_MS) < 0 ||
+        minikv_server_test_force_next_send_would_block(server) != 0 ||
+        send_all(client_fd, ping, sizeof(ping) - 1U) < 0 ||
+        receive_exact_with_server(
+            server,
+            client_fd,
+            pong,
+            sizeof(pong) - 1U) < 0) {
+        goto cleanup;
+    }
+
+    if (send_all(client_fd, ping, sizeof(ping) - 1U) < 0 ||
+        receive_exact_with_server(
+            server,
+            client_fd,
+            pong,
+            sizeof(pong) - 1U) < 0 ||
+        minikv_server_connection_count(server) != 1U ||
+        minikv_server_test_set_send_chunk_limit(server, 0U) != 0) {
+        goto cleanup;
+    }
+
+    result = 0;
+
+cleanup:
+    if (close_owned_fd(&client_fd) < 0) {
+        result = 1;
+    }
+
+    minikv_server_destroy(server);
+    return result;
+}
+
+static int test_short_writes_and_pipeline(void)
+{
+    static const unsigned char echo[] =
+        "*2\r\n$4\r\nECHO\r\n$12\r\nhello world!\r\n";
+    static const unsigned char echo_reply[] =
+        "$12\r\nhello world!\r\n";
+    static const unsigned char pipeline[] =
+        "*1\r\n$4\r\nPING\r\n"
+        "*2\r\n$4\r\nECHO\r\n$5\r\nhello\r\n"
+        "*1\r\n$3\r\nGET\r\n"
+        "*2\r\n$4\r\nPING\r\n$5\r\nworld\r\n";
+    static const unsigned char pipeline_reply[] =
+        "+PONG\r\n"
+        "$5\r\nhello\r\n"
+        "-ERR unknown command\r\n"
+        "$5\r\nworld\r\n";
+    static const unsigned char ping[] =
+        "*1\r\n$4\r\nPING\r\n";
+    static const unsigned char pong[] = "+PONG\r\n";
+    const struct minikv_server_options options = {
+        "127.0.0.1",
+        0U
+    };
+    struct minikv_server *server = NULL;
+    int client_fd = -1;
+    int result = 1;
+
+    if (minikv_server_create(&server, &options) < 0 ||
+        minikv_server_test_set_send_chunk_limit(server, 2U) != 0) {
+        goto cleanup;
+    }
+
+    client_fd = connect_client(minikv_server_bound_port(server));
+
+    if (client_fd < 0 ||
+        wait_for_connection_count(server, 1U, IO_TIMEOUT_MS) < 0 ||
+        send_all(client_fd, echo, sizeof(echo) - 1U) < 0 ||
+        receive_exact_with_server(
+            server,
+            client_fd,
+            echo_reply,
+            sizeof(echo_reply) - 1U) < 0 ||
+        send_all(client_fd, ping, sizeof(ping) - 1U) < 0 ||
+        receive_exact_with_server(
+            server,
+            client_fd,
+            pong,
+            sizeof(pong) - 1U) < 0 ||
+        send_all(client_fd, pipeline, sizeof(pipeline) - 1U) < 0 ||
+        receive_exact_with_server(
+            server,
+            client_fd,
+            pipeline_reply,
+            sizeof(pipeline_reply) - 1U) < 0) {
+        goto cleanup;
+    }
+
+    result = 0;
+
+cleanup:
+    if (close_owned_fd(&client_fd) < 0) {
+        result = 1;
+    }
+
+    minikv_server_destroy(server);
+    return result;
+}
+
+static int test_output_limit_boundaries(void)
+{
+    static const unsigned char exact_request[] =
+        "*2\r\n$4\r\nECHO\r\n$8\r\n12345678\r\n";
+    static const unsigned char exact_reply[] =
+        "$8\r\n12345678\r\n";
+    static const unsigned char too_large_request[] =
+        "*2\r\n$4\r\nECHO\r\n$9\r\n123456789\r\n";
+    static const unsigned char ping[] =
+        "*1\r\n$4\r\nPING\r\n";
+    static const unsigned char pong[] = "+PONG\r\n";
+    const struct minikv_server_options options = {
+        "127.0.0.1",
+        0U
+    };
+    struct minikv_server *server = NULL;
+    int exact_client = -1;
+    int rejected_client = -1;
+    int healthy_client = -1;
+    int result = 1;
+
+    if (minikv_server_create(&server, &options) < 0 ||
+        minikv_server_test_set_output_limit(server, 14U) != 0) {
+        goto cleanup;
+    }
+
+    exact_client = connect_client(minikv_server_bound_port(server));
+
+    if (exact_client < 0 ||
+        wait_for_connection_count(server, 1U, IO_TIMEOUT_MS) < 0 ||
+        send_all(
+            exact_client,
+            exact_request,
+            sizeof(exact_request) - 1U) < 0 ||
+        receive_exact_with_server(
+            server,
+            exact_client,
+            exact_reply,
+            sizeof(exact_reply) - 1U) < 0) {
+        goto cleanup;
+    }
+
+    if (close_owned_fd(&exact_client) < 0 ||
+        wait_for_connection_count(server, 0U, IO_TIMEOUT_MS) < 0) {
+        goto cleanup;
+    }
+
+    rejected_client = connect_client(minikv_server_bound_port(server));
+
+    if (rejected_client < 0 ||
+        wait_for_connection_count(server, 1U, IO_TIMEOUT_MS) < 0 ||
+        send_all(
+            rejected_client,
+            too_large_request,
+            sizeof(too_large_request) - 1U) < 0 ||
+        expect_eof_without_data(server, rejected_client) < 0 ||
+        wait_for_connection_count(server, 0U, IO_TIMEOUT_MS) < 0) {
+        goto cleanup;
+    }
+
+    healthy_client = connect_client(minikv_server_bound_port(server));
+
+    if (healthy_client < 0 ||
+        wait_for_connection_count(server, 1U, IO_TIMEOUT_MS) < 0 ||
+        send_all(healthy_client, ping, sizeof(ping) - 1U) < 0 ||
+        receive_exact_with_server(
+            server,
+            healthy_client,
+            pong,
+            sizeof(pong) - 1U) < 0) {
+        goto cleanup;
+    }
+
+    result = 0;
+
+cleanup:
+    if (close_owned_fd(&exact_client) < 0 ||
+        close_owned_fd(&rejected_client) < 0 ||
+        close_owned_fd(&healthy_client) < 0) {
+        result = 1;
+    }
+
+    minikv_server_destroy(server);
+    return result;
+}
+
+static int test_destroy_with_partial_and_pending_connections(void)
+{
+    static const unsigned char partial[] = "*1\r\n$4\r\nPI";
+    static const unsigned char ping[] = "*1\r\n$4\r\nPING\r\n";
+    const struct minikv_server_options options = {
+        "127.0.0.1",
+        0U
+    };
+    struct minikv_server *server = NULL;
+    int partial_client = -1;
+    int pending_client = -1;
+    int result = 1;
+
+    if (minikv_server_create(&server, &options) < 0 ||
+        minikv_server_test_set_send_chunk_limit(server, 1U) != 0 ||
+        minikv_server_test_force_next_send_would_block(server) != 0) {
+        goto cleanup;
+    }
+
+    partial_client = connect_client(minikv_server_bound_port(server));
+    pending_client = connect_client(minikv_server_bound_port(server));
+
+    if (partial_client < 0 ||
+        pending_client < 0 ||
+        wait_for_connection_count(server, 2U, IO_TIMEOUT_MS) < 0 ||
+        send_all(partial_client, partial, sizeof(partial) - 1U) < 0 ||
+        send_all(pending_client, ping, sizeof(ping) - 1U) < 0 ||
+        minikv_server_poll(server, EVENT_TIMEOUT_MS) !=
+            MINIKV_POLL_CONTINUE) {
+        goto cleanup;
+    }
+
+    minikv_server_destroy(server);
+    server = NULL;
+    result = 0;
+
+cleanup:
+    if (close_owned_fd(&partial_client) < 0 ||
+        close_owned_fd(&pending_client) < 0) {
+        result = 1;
+    }
+
+    minikv_server_destroy(server);
+    return result;
+}
+
 int main(void)
 {
     static const struct test_case cases[] = {
         {"basic create and destroy", test_basic_create_and_destroy},
         {"accept, data, and cleanup", test_accept_data_and_cleanup},
         {"invalid address", test_invalid_address},
-        {"repeated ephemeral server", test_repeated_ephemeral_server}
+        {"repeated ephemeral server", test_repeated_ephemeral_server},
+        {"test hook arguments", test_hook_arguments},
+        {"forced EAGAIN and connection reuse",
+         test_forced_eagain_and_connection_reuse},
+        {"short writes and pipeline", test_short_writes_and_pipeline},
+        {"output limit boundaries", test_output_limit_boundaries},
+        {"destroy partial and pending connections",
+         test_destroy_with_partial_and_pending_connections}
     };
     size_t index;
     int failures = 0;

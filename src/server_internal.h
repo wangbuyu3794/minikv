@@ -66,4 +66,19 @@ int minikv_server_connection_fd(
     const struct minikv_server *server,
     size_t index);
 
+#ifdef MINIKV_SERVER_TESTING
+
+int minikv_server_test_set_send_chunk_limit(
+    struct minikv_server *server,
+    size_t limit);
+
+int minikv_server_test_force_next_send_would_block(
+    struct minikv_server *server);
+
+int minikv_server_test_set_output_limit(
+    struct minikv_server *server,
+    size_t limit);
+
+#endif
+
 #endif

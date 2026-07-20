@@ -14,8 +14,11 @@ function(minikv_enable_warnings target)
     endif()
 endfunction()
 
+include(CTest)
+
 add_library(minikv_resp2 STATIC
     src/resp2_parser.c
+    src/resp2_encoder.c
 )
 
 minikv_enable_warnings(minikv_resp2)
@@ -26,6 +29,17 @@ if(BUILD_TESTING)
             MINIKV_RESP2_TESTING
     )
 endif()
+
+add_library(minikv_command STATIC
+    src/command.c
+)
+
+target_link_libraries(minikv_command
+    PUBLIC
+        minikv_resp2
+)
+
+minikv_enable_warnings(minikv_command)
 
 add_library(minikv_core STATIC
     src/version.c
@@ -58,6 +72,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         PRIVATE
             _GNU_SOURCE
     )
+
+    target_link_libraries(minikv_server_runtime
+        PRIVATE
+            minikv_command
+            minikv_resp2
+    )
+
+    if(BUILD_TESTING)
+        target_compile_definitions(minikv_server_runtime
+            PRIVATE
+                MINIKV_SERVER_TESTING
+        )
+    endif()
 endif()
 
 minikv_enable_warnings(minikv_server_runtime)
@@ -79,9 +106,49 @@ target_link_libraries(minikv-server
 
 minikv_enable_warnings(minikv-server)
 
-include(CTest)
-
 if(BUILD_TESTING)
+    add_executable(minikv_resp2_encoder_test
+        tests/resp2_encoder_test.c
+    )
+
+    target_include_directories(minikv_resp2_encoder_test
+        PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    target_link_libraries(minikv_resp2_encoder_test
+        PRIVATE
+            minikv_resp2
+    )
+
+    minikv_enable_warnings(minikv_resp2_encoder_test)
+
+    add_test(
+        NAME minikv.resp2.encoder
+        COMMAND minikv_resp2_encoder_test
+    )
+
+    add_executable(minikv_command_test
+        tests/command_test.c
+    )
+
+    target_include_directories(minikv_command_test
+        PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    target_link_libraries(minikv_command_test
+        PRIVATE
+            minikv_command
+    )
+
+    minikv_enable_warnings(minikv_command_test)
+
+    add_test(
+        NAME minikv.command
+        COMMAND minikv_command_test
+    )
+
     add_executable(minikv_resp2_parser_test
         tests/resp2_parser_test.c
     )
@@ -161,6 +228,11 @@ if(BUILD_TESTING)
             tests/server_linux_test.c
         )
 
+        target_compile_definitions(minikv_server_linux_test
+            PRIVATE
+                MINIKV_SERVER_TESTING
+        )
+
         target_include_directories(minikv_server_linux_test
             PRIVATE
                 "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -207,7 +279,7 @@ if(BUILD_TESTING)
         )
 
         set_tests_properties(minikv.server.integration PROPERTIES
-            TIMEOUT 15
+            TIMEOUT 60
         )
     endif()
 endif()
