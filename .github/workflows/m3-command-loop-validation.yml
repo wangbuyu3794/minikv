@@ -1,0 +1,706 @@
+name: M3 Command Loop Linux Validation
+
+on:
+  push:
+    branches:
+      - validation/m3-command-loop-linux
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - gcc
+          - clang
+        build_type:
+          - Debug
+          - Release
+
+    env:
+      CC: ${{ matrix.compiler }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Environment info
+        run: |
+          set -euxo pipefail
+          uname -a
+          cmake --version
+          "$CC" --version
+          python3 --version
+          echo "Build type: ${{ matrix.build_type }}"
+
+      - name: Configure tests
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build/m3-validation \
+            -DCMAKE_BUILD_TYPE="${{ matrix.build_type }}" \
+            -DBUILD_TESTING=ON \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Build tests
+        run: |
+          set -euxo pipefail
+          cmake --build build/m3-validation --parallel
+
+      - name: Verify registered tests
+        run: |
+          set -euxo pipefail
+          ctest --test-dir build/m3-validation \
+            --show-only=json-v1 \
+            > "$RUNNER_TEMP/m3-ctest.json"
+
+          python3 - "$RUNNER_TEMP/m3-ctest.json" <<'PY'
+          import json
+          import sys
+
+          expected = [
+              "minikv.resp2.parser",
+              "minikv.server.help",
+              "minikv.server.integration",
+              "minikv.server.linux",
+              "minikv.server.short-help",
+              "minikv.smoke",
+          ]
+
+          with open(sys.argv[1], "r", encoding="utf-8") as handle:
+              document = json.load(handle)
+
+          names = [test["name"] for test in document.get("tests", [])]
+          if len(names) != len(expected) or sorted(names) != expected:
+              raise SystemExit(
+                  f"unexpected CTest registration: {names!r}"
+              )
+
+          print("registered Linux tests:", ", ".join(sorted(names)))
+          PY
+
+      - name: Verify testing compile definitions
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("build/m3-validation/compile_commands.json")
+          entries = json.loads(path.read_text(encoding="utf-8"))
+
+          def commands_for(suffix):
+              matches = []
+              for entry in entries:
+                  source = Path(entry["file"]).as_posix()
+                  if source.endswith(suffix):
+                      command = entry.get("command")
+                      if command is None:
+                          command = " ".join(entry["arguments"])
+                      matches.append(command)
+              return matches
+
+          runtime = commands_for("/src/server_linux.c")
+          lifecycle = commands_for("/tests/server_linux_test.c")
+
+          if len(runtime) != 1:
+              raise SystemExit(
+                  f"expected one server_linux.c command, got {len(runtime)}"
+              )
+          if len(lifecycle) != 1:
+              raise SystemExit(
+                  "expected one server_linux_test.c command, "
+                  f"got {len(lifecycle)}"
+              )
+          if "MINIKV_SERVER_TESTING" not in runtime[0]:
+              raise SystemExit("runtime testing macro is missing")
+          if "MINIKV_SERVER_TESTING" not in lifecycle[0]:
+              raise SystemExit("lifecycle test macro is missing")
+
+          print("testing compile definitions verified")
+          print("server_linux.c compiler command:", runtime[0])
+          PY
+
+      - name: Run Linux tests
+        run: |
+          set -euxo pipefail
+          ctest --test-dir build/m3-validation \
+            --output-on-failure \
+            --no-tests=error
+
+      - name: Run command-loop client validation
+        run: |
+          set -euxo pipefail
+          cat > "$RUNNER_TEMP/m3_command_loop_client.py" <<'PY'
+          import os
+          import re
+          import selectors
+          import socket
+          import subprocess
+          import sys
+          import time
+          import traceback
+
+          IO_TIMEOUT = 5.0
+          START_TIMEOUT = 5.0
+          STOP_TIMEOUT = 5.0
+
+          PONG = b"+PONG\r\n"
+          UNKNOWN = b"-ERR unknown command\r\n"
+          PROTOCOL_ERROR = b"-ERR Protocol error\r\n"
+          PING_ARITY = (
+              b"-ERR wrong number of arguments for 'ping' command\r\n"
+          )
+          ECHO_ARITY = (
+              b"-ERR wrong number of arguments for 'echo' command\r\n"
+          )
+
+
+          def array_request(*items):
+              result = bytearray(f"*{len(items)}\r\n".encode("ascii"))
+              for item in items:
+                  result.extend(f"${len(item)}\r\n".encode("ascii"))
+                  result.extend(item)
+                  result.extend(b"\r\n")
+              return bytes(result)
+
+
+          def bulk_reply(payload):
+              return (
+                  f"${len(payload)}\r\n".encode("ascii")
+                  + payload
+                  + b"\r\n"
+              )
+
+
+          def recv_exact(client, length):
+              chunks = []
+              remaining = length
+              while remaining:
+                  chunk = client.recv(remaining)
+                  if chunk == b"":
+                      raise AssertionError(
+                          f"unexpected EOF with {remaining} bytes missing"
+                      )
+                  chunks.append(chunk)
+                  remaining -= len(chunk)
+              return b"".join(chunks)
+
+
+          def expect_bytes(client, expected):
+              actual = recv_exact(client, len(expected))
+              if actual != expected:
+                  raise AssertionError(
+                      f"response mismatch: expected={expected!r}, "
+                      f"actual={actual!r}"
+                  )
+
+
+          def expect_eof(client):
+              while True:
+                  try:
+                      data = client.recv(4096)
+                  except socket.timeout as error:
+                      raise AssertionError(
+                          "timed out waiting for EOF"
+                      ) from error
+                  if data == b"":
+                      return
+                  raise AssertionError(
+                      f"received data before EOF: {data!r}"
+                  )
+
+
+          class Server:
+              def __init__(self, executable):
+                  self.executable = os.path.abspath(executable)
+                  self.process = None
+                  self.port = None
+                  self.startup_stdout = b""
+
+              def start(self):
+                  self.process = subprocess.Popen(
+                      [
+                          self.executable,
+                          "--bind",
+                          "127.0.0.1",
+                          "--port",
+                          "0",
+                      ],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      bufsize=0,
+                  )
+
+                  selector = selectors.DefaultSelector()
+                  selector.register(
+                      self.process.stdout,
+                      selectors.EVENT_READ,
+                  )
+                  deadline = time.monotonic() + START_TIMEOUT
+                  line = b""
+
+                  try:
+                      while time.monotonic() < deadline:
+                          if self.process.poll() is not None:
+                              raise RuntimeError(
+                                  "server exited before readiness"
+                              )
+                          events = selector.select(
+                              deadline - time.monotonic()
+                          )
+                          if not events:
+                              continue
+                          line = self.process.stdout.readline()
+                          if line:
+                              break
+                  finally:
+                      selector.close()
+
+                  self.startup_stdout = line
+                  match = re.fullmatch(
+                      rb"MiniKV listening on 127\.0\.0\.1:(\d+)\r?\n",
+                      line,
+                  )
+                  if match is None:
+                      raise RuntimeError(
+                          f"invalid readiness line: {line!r}"
+                      )
+
+                  self.port = int(match.group(1))
+                  if not 1 <= self.port <= 65535:
+                      raise RuntimeError(
+                          f"invalid readiness port: {self.port}"
+                      )
+
+                  deadline = time.monotonic() + START_TIMEOUT
+                  while True:
+                      try:
+                          probe = self.connect()
+                      except OSError:
+                          if time.monotonic() >= deadline:
+                              raise
+                          time.sleep(0.05)
+                      else:
+                          probe.close()
+                          break
+
+              def connect(self):
+                  client = socket.create_connection(
+                      ("127.0.0.1", self.port),
+                      timeout=IO_TIMEOUT,
+                  )
+                  client.settimeout(IO_TIMEOUT)
+                  return client
+
+              def stop(self):
+                  if self.process is None:
+                      return b"", b"", None
+
+                  killed = False
+                  if self.process.poll() is None:
+                      self.process.terminate()
+                      try:
+                          self.process.wait(timeout=STOP_TIMEOUT)
+                      except subprocess.TimeoutExpired:
+                          killed = True
+                          self.process.kill()
+                          self.process.wait(timeout=STOP_TIMEOUT)
+
+                  remaining_stdout, stderr = self.process.communicate(
+                      timeout=STOP_TIMEOUT
+                  )
+                  stdout = self.startup_stdout + remaining_stdout
+                  return stdout, stderr, (self.process.returncode, killed)
+
+
+          def run_case(name, operation):
+              operation()
+              print(f"PASSED: {name}")
+
+
+          def main():
+              server = Server(sys.argv[1])
+              failure = None
+              stop_failure = None
+              stdout = b""
+              stderr = b""
+              stop_status = None
+
+              try:
+                  server.start()
+
+                  def simple_request(request, response):
+                      with server.connect() as client:
+                          client.sendall(request)
+                          expect_bytes(client, response)
+
+                  run_case(
+                      "PING",
+                      lambda: simple_request(
+                          array_request(b"PING"),
+                          PONG,
+                      ),
+                  )
+
+                  def case_insensitive():
+                      cases = [
+                          (array_request(b"ping"), PONG),
+                          (array_request(b"PiNg"), PONG),
+                          (
+                              array_request(b"echo", b"x"),
+                              bulk_reply(b"x"),
+                          ),
+                          (
+                              array_request(b"EcHo", b"y"),
+                              bulk_reply(b"y"),
+                          ),
+                      ]
+                      with server.connect() as client:
+                          for request, response in cases:
+                              client.sendall(request)
+                              expect_bytes(client, response)
+
+                  run_case("ASCII case-insensitive commands", case_insensitive)
+
+                  run_case(
+                      "PING message",
+                      lambda: simple_request(
+                          array_request(b"PING", b"hello"),
+                          bulk_reply(b"hello"),
+                      ),
+                  )
+
+                  binary = b"\x00\r\n\r\n"
+                  run_case(
+                      "binary ECHO",
+                      lambda: simple_request(
+                          array_request(b"ECHO", binary),
+                          bulk_reply(binary),
+                      ),
+                  )
+
+                  def single_write_pipeline():
+                      request = b"".join(
+                          [
+                              array_request(b"PING"),
+                              array_request(b"ECHO", b"hello"),
+                              array_request(b"GET"),
+                              array_request(b"PING", b"world"),
+                          ]
+                      )
+                      expected = b"".join(
+                          [
+                              PONG,
+                              bulk_reply(b"hello"),
+                              UNKNOWN,
+                              bulk_reply(b"world"),
+                          ]
+                      )
+                      with server.connect() as client:
+                          client.sendall(request)
+                          expect_bytes(client, expected)
+
+                  run_case("single-write pipeline", single_write_pipeline)
+
+                  def fragmented_ping():
+                      request = array_request(b"PING")
+                      with server.connect() as client:
+                          for byte in request:
+                              client.sendall(bytes([byte]))
+                              time.sleep(0.002)
+                          expect_bytes(client, PONG)
+
+                  run_case("bytewise fragmentation", fragmented_ping)
+
+                  def unknown_then_ping():
+                      with server.connect() as client:
+                          client.sendall(array_request(b"GET"))
+                          expect_bytes(client, UNKNOWN)
+                          client.sendall(array_request(b"PING"))
+                          expect_bytes(client, PONG)
+
+                  run_case("unknown then PING", unknown_then_ping)
+
+                  def wrong_arity_then_ping():
+                      with server.connect() as client:
+                          client.sendall(
+                              array_request(b"PING", b"a", b"b")
+                          )
+                          expect_bytes(client, PING_ARITY)
+                          client.sendall(array_request(b"PING"))
+                          expect_bytes(client, PONG)
+                          client.sendall(array_request(b"ECHO"))
+                          expect_bytes(client, ECHO_ARITY)
+                          client.sendall(array_request(b"PING"))
+                          expect_bytes(client, PONG)
+
+                  run_case(
+                      "wrong arity then PING",
+                      wrong_arity_then_ping,
+                  )
+
+                  def malformed_input():
+                      with server.connect() as client:
+                          client.sendall(b"?\r\n")
+                          expect_bytes(client, PROTOCOL_ERROR)
+                          expect_eof(client)
+
+                  run_case("malformed RESP", malformed_input)
+
+                  def invalid_command_shape():
+                      with server.connect() as client:
+                          client.sendall(b"$4\r\nPING\r\n")
+                          expect_bytes(client, PROTOCOL_ERROR)
+                          expect_eof(client)
+
+                  run_case(
+                      "invalid command shape",
+                      invalid_command_shape,
+                  )
+
+                  def queued_reply_before_error():
+                      with server.connect() as client:
+                          client.sendall(
+                              array_request(b"PING") + b"?\r\n"
+                          )
+                          expect_bytes(
+                              client,
+                              PONG + PROTOCOL_ERROR,
+                          )
+                          expect_eof(client)
+
+                  run_case(
+                      "queued reply before protocol error",
+                      queued_reply_before_error,
+                  )
+
+                  def complete_then_half_close():
+                      with server.connect() as client:
+                          client.sendall(array_request(b"PING"))
+                          client.shutdown(socket.SHUT_WR)
+                          expect_bytes(client, PONG)
+                          expect_eof(client)
+
+                  run_case(
+                      "complete request then half-close",
+                      complete_then_half_close,
+                  )
+
+                  def partial_then_half_close():
+                      with server.connect() as client:
+                          client.sendall(b"*1\r\n$4\r\nPI")
+                          client.shutdown(socket.SHUT_WR)
+                          expect_eof(client)
+
+                  run_case(
+                      "partial request then half-close",
+                      partial_then_half_close,
+                  )
+
+                  def parser_isolation():
+                      first = server.connect()
+                      second = server.connect()
+                      try:
+                          first.sendall(b"*1\r\n$4\r\nPI")
+                          second.sendall(array_request(b"PING"))
+                          expect_bytes(second, PONG)
+                          first.sendall(b"NG\r\n")
+                          expect_bytes(first, PONG)
+                      finally:
+                          first.close()
+                          second.close()
+
+                  run_case("per-client parser isolation", parser_isolation)
+
+                  def disconnect_isolation():
+                      first = server.connect()
+                      first.close()
+                      with server.connect() as second:
+                          second.sendall(array_request(b"PING"))
+                          expect_bytes(second, PONG)
+
+                  run_case(
+                      "normal disconnect isolation",
+                      disconnect_isolation,
+                  )
+
+                  def repeated_pipelines():
+                      with server.connect() as client:
+                          batch_one = (
+                              array_request(b"PING")
+                              + array_request(b"ECHO", b"one")
+                          )
+                          client.sendall(batch_one)
+                          expect_bytes(
+                              client,
+                              PONG + bulk_reply(b"one"),
+                          )
+
+                          batch_two = (
+                              array_request(b"GET")
+                              + array_request(b"PING", b"two")
+                          )
+                          client.sendall(batch_two)
+                          expect_bytes(
+                              client,
+                              UNKNOWN + bulk_reply(b"two"),
+                          )
+
+                  run_case(
+                      "multiple pipeline batches",
+                      repeated_pipelines,
+                  )
+
+              except BaseException as error:
+                  failure = error
+                  traceback.print_exc()
+              finally:
+                  try:
+                      stdout, stderr, stop_status = server.stop()
+                  except BaseException as error:
+                      stop_failure = error
+                      traceback.print_exc()
+
+              if failure is not None or stop_failure is not None:
+                  print("----- server stdout -----", file=sys.stderr)
+                  print(
+                      stdout.decode("utf-8", errors="replace"),
+                      file=sys.stderr,
+                  )
+                  print("----- server stderr -----", file=sys.stderr)
+                  print(
+                      stderr.decode("utf-8", errors="replace"),
+                      file=sys.stderr,
+                  )
+                  print(
+                      f"server stop status: {stop_status!r}",
+                      file=sys.stderr,
+                  )
+                  return 1
+
+              if stop_status != (0, False):
+                  print(
+                      f"unexpected server stop status: {stop_status!r}",
+                      file=sys.stderr,
+                  )
+                  print(
+                      stderr.decode("utf-8", errors="replace"),
+                      file=sys.stderr,
+                  )
+                  return 1
+
+              print("all command-loop client scenarios passed")
+              return 0
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PY
+
+          timeout 60s python3 \
+            "$RUNNER_TEMP/m3_command_loop_client.py" \
+            build/m3-validation/minikv-server
+
+      - name: Configure production
+        run: |
+          set -euxo pipefail
+          cmake -S . -B build/m3-production \
+            -DCMAKE_BUILD_TYPE="${{ matrix.build_type }}" \
+            -DBUILD_TESTING=OFF \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Build production
+        run: |
+          set -euxo pipefail
+          cmake --build build/m3-production --parallel
+
+      - name: Verify production isolation
+        run: |
+          set -euxo pipefail
+          ctest --test-dir build/m3-production \
+            --show-only=json-v1 \
+            > "$RUNNER_TEMP/m3-production-ctest.json"
+
+          python3 - "$RUNNER_TEMP/m3-production-ctest.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          with open(sys.argv[1], "r", encoding="utf-8") as handle:
+              document = json.load(handle)
+          tests = document.get("tests", [])
+          if tests:
+              raise SystemExit(
+                  f"production unexpectedly registered tests: {tests!r}"
+              )
+
+          entries = json.loads(
+              Path(
+                  "build/m3-production/compile_commands.json"
+              ).read_text(encoding="utf-8")
+          )
+          runtime = []
+          for entry in entries:
+              if Path(entry["file"]).as_posix().endswith(
+                  "/src/server_linux.c"
+              ):
+                  command = entry.get("command")
+                  if command is None:
+                      command = " ".join(entry["arguments"])
+                  runtime.append(command)
+
+          if len(runtime) != 1:
+              raise SystemExit(
+                  f"expected one production runtime command, got "
+                  f"{len(runtime)}"
+              )
+          if "MINIKV_SERVER_TESTING" in runtime[0]:
+              raise SystemExit(
+                  "production runtime contains testing macro"
+              )
+
+          link_text = Path(
+              "build/m3-production/"
+              "CMakeFiles/minikv-server.dir/link.txt"
+          ).read_text(encoding="utf-8")
+          for library in ("libminikv_command.a", "libminikv_resp2.a"):
+              if library not in link_text:
+                  raise SystemExit(
+                      f"production server link is missing {library}"
+                  )
+
+          forbidden = [
+              "minikv_smoke",
+              "minikv_resp2_parser_test",
+              "minikv_server_linux_test",
+              "minikv_server_integration_test",
+          ]
+          build_root = Path("build/m3-production")
+          generated = {
+              path.name
+              for path in build_root.rglob("*")
+              if path.is_file()
+          }
+          unexpected = sorted(
+              name for name in forbidden if name in generated
+          )
+          if unexpected:
+              raise SystemExit(
+                  f"production contains test executables: {unexpected!r}"
+              )
+
+          print("production CTest count: 0")
+          print("production runtime testing macro: absent")
+          print("production server RESP2/command links: present")
+          print("production test executables: absent")
+          print("server_linux.c compiler command:", runtime[0])
+          PY
