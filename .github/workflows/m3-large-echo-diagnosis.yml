@@ -141,6 +141,13 @@ jobs:
           LIVENESS_SNAPSHOTS = (5, 10, 30, 60, 90, 120)
           ISOLATION_CHECKS = (5, 10, 30, 60, 90)
           FORMAL_CONNECT_BEFORE_RCVBUF_SET = True
+          ALLOWED_CLASSIFICATIONS = frozenset({
+              "TEST_DEADLINE_TOO_STRICT",
+              "FORMAL_TEST_LOGIC_PROBLEM",
+              "SERVER_OUTPUT_STALL",
+              "SERVER_CONNECTION_FAILURE",
+              "INCONCLUSIVE",
+          })
 
 
           def remaining_milliseconds(deadline):
@@ -1250,6 +1257,11 @@ jobs:
                   formal_status_path,
               )
               classification, reason = classify(formal, scenarios)
+              if classification not in ALLOWED_CLASSIFICATIONS:
+                  raise RuntimeError(
+                      "unsupported diagnosis classification: "
+                      f"{classification!r}"
+                  )
               document = {
                   "compiler": compiler,
                   "build_type": build_type,
@@ -1303,6 +1315,7 @@ jobs:
               "SERVER_OUTPUT_STALL",
               "SERVER_CONNECTION_FAILURE",
               "INCONCLUSIVE",
+              "ALLOWED_CLASSIFICATIONS",
               "scenario_a",
               "scenario_b",
               "scenario_c",
@@ -1328,6 +1341,18 @@ jobs:
           if missing:
               raise SystemExit(
                   f"missing diagnosis script tokens: {missing}"
+              )
+
+          forbidden = [
+              'return "FORMAL_TEST_LOGIC_PROBLEM"',
+              "return 'FORMAL_TEST_LOGIC_PROBLEM'",
+              'classification = "FORMAL_TEST_LOGIC_PROBLEM"',
+              "classification = 'FORMAL_TEST_LOGIC_PROBLEM'",
+          ]
+          present = [item for item in forbidden if item in text]
+          if present:
+              raise SystemExit(
+                  f"forbidden diagnosis script patterns: {present}"
               )
 
           print(f"diagnosis script bytes: {len(data)}")
