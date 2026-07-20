@@ -124,6 +124,22 @@ jobs:
           KILL_TIMEOUT = 2.0
           PONG = b"+PONG\r\n"
           SNAPSHOTS = (1, 2, 5, 10, 20, 30)
+          EXTENDED_SNAPSHOTS = (
+              1,
+              2,
+              5,
+              10,
+              20,
+              30,
+              45,
+              60,
+              75,
+              90,
+              105,
+              120,
+          )
+          LIVENESS_SNAPSHOTS = (5, 10, 30, 60, 90, 120)
+          ISOLATION_CHECKS = (5, 10, 30, 60, 90)
 
 
           def remaining_milliseconds(deadline):
@@ -149,9 +165,23 @@ jobs:
                   return ready[0][1]
 
 
-          def connect_client(port, requested_rcvbuf=None, timeout=PING_TIMEOUT):
+          def connect_client(
+              port,
+              requested_rcvbuf=None,
+              timeout=PING_TIMEOUT,
+              set_rcvbuf_before_connect=False,
+          ):
               client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
               client.setblocking(False)
+              if (
+                  requested_rcvbuf is not None
+                  and set_rcvbuf_before_connect
+              ):
+                  client.setsockopt(
+                      socket.SOL_SOCKET,
+                      socket.SO_RCVBUF,
+                      requested_rcvbuf,
+                  )
               before = client.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
               deadline = time.monotonic() + timeout
               error = client.connect_ex(("127.0.0.1", port))
@@ -176,7 +206,10 @@ jobs:
                       client.close()
                       raise OSError(socket_error, os.strerror(socket_error))
 
-              if requested_rcvbuf is not None:
+              if (
+                  requested_rcvbuf is not None
+                  and not set_rcvbuf_before_connect
+              ):
                   client.setsockopt(
                       socket.SOL_SOCKET,
                       socket.SO_RCVBUF,
@@ -371,6 +404,7 @@ jobs:
                   "actual_rcvbuf_after_connect": None,
                   "payload_size": payload_size,
                   "expected_response_size": expected_size,
+                  "deadline_seconds": None,
                   "read_delay_seconds": None,
                   "formal_isolation_ping": None,
                   "first_byte_seconds": None,
@@ -380,24 +414,48 @@ jobs:
                   "bytes_at_10s": None,
                   "bytes_at_20s": None,
                   "bytes_at_30s": None,
+                  "bytes_at_45s": None,
+                  "bytes_at_60s": None,
+                  "bytes_at_75s": None,
+                  "bytes_at_90s": None,
+                  "bytes_at_105s": None,
+                  "bytes_at_120s": None,
                   "total_received": 0,
                   "completion_seconds": None,
+                  "average_bytes_per_second": None,
+                  "estimated_completion_seconds": None,
                   "eof_seen": False,
                   "response_exact_match": False,
+                  "response_header_match": False,
+                  "response_payload_match": False,
+                  "response_trailing_crlf_match": False,
                   "extra_bytes_seen": False,
+                  "ping_after_echo_attempted": False,
                   "ping_after_echo_success": False,
+                  "ping_after_echo_elapsed_seconds": None,
+                  "ping_after_echo_response": None,
+                  "ping_after_echo_error": None,
                   "server_alive_at_5s": None,
                   "server_alive_at_10s": None,
+                  "server_alive_at_30s": None,
+                  "server_alive_at_60s": None,
+                  "server_alive_at_90s": None,
+                  "server_alive_at_120s": None,
                   "server_exited_during_scenario": False,
                   "server_exit_code": None,
                   "second_client_ping_at_5s": None,
                   "second_client_ping_at_10s": None,
+                  "second_client_ping_at_30s": None,
+                  "second_client_ping_at_60s": None,
+                  "second_client_ping_at_90s": None,
                   "last_progress_seconds": None,
                   "stall_duration_seconds": None,
+                  "maximum_no_progress_seconds": 0.0,
                   "ss_at_5s": None,
                   "ss_at_10s": None,
                   "server_stdout": None,
                   "server_stderr": None,
+                  "socket_error": None,
                   "error": None,
               }
               return result
@@ -405,7 +463,7 @@ jobs:
 
           PY
 
-      - name: Append scenario runner
+      - name: Append scenario runner setup
         run: |
           set -euxo pipefail
           cat >> "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
@@ -419,6 +477,7 @@ jobs:
               use_formal_delay,
               deadline_seconds,
               schedule_isolation_checks,
+              set_rcvbuf_before_connect,
           ):
               result = initial_scenario_result(
                   name,
@@ -435,10 +494,17 @@ jobs:
               last_progress_time = None
               reached = set()
               total = 0
-              exact = True
+              response = bytearray()
+              snapshots = (
+                  EXTENDED_SNAPSHOTS
+                  if deadline_seconds > 30.0
+                  else SNAPSHOTS
+              )
+              result["deadline_seconds"] = deadline_seconds
 
               def probe_worker(second):
                   probe = ping_server(server.port)
+                  probe["server_process_alive"] = server.alive()
                   with probe_lock:
                       probe_results[second] = probe
 
@@ -457,6 +523,9 @@ jobs:
                       server.port,
                       requested_rcvbuf=requested_rcvbuf,
                       timeout=PING_TIMEOUT,
+                      set_rcvbuf_before_connect=(
+                          set_rcvbuf_before_connect
+                      ),
                   )
                   result["actual_rcvbuf_before_connect"] = before
                   result["actual_rcvbuf_after_connect"] = after
@@ -474,22 +543,36 @@ jobs:
                   last_progress_time = read_started
                   deadline = read_started + deadline_seconds
 
+          PY
+
+      - name: Append scenario receive and cleanup
+        run: |
+          set -euxo pipefail
+          cat >> "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
                   while total < len(expected):
                       now = time.monotonic()
                       elapsed = now - read_started
+                      no_progress = now - last_progress_time
+                      result["maximum_no_progress_seconds"] = round(
+                          max(
+                              result["maximum_no_progress_seconds"],
+                              no_progress,
+                          ),
+                          6,
+                      )
 
-                      for second in SNAPSHOTS:
+                      for second in snapshots:
                           if second in reached or elapsed < second:
                               continue
                           reached.add(second)
                           result[f"bytes_at_{second}s"] = total
-                          if second == 5:
-                              result["server_alive_at_5s"] = server.alive()
-                          if second == 10:
-                              result["server_alive_at_10s"] = server.alive()
+                          if second in LIVENESS_SNAPSHOTS:
+                              result[
+                                  f"server_alive_at_{second}s"
+                              ] = server.alive()
                           if (
                               schedule_isolation_checks
-                              and second in (5, 10)
+                              and second in ISOLATION_CHECKS
                               and total < len(expected)
                           ):
                               start_probe(second)
@@ -505,7 +588,7 @@ jobs:
                           break
 
                       next_times = [deadline]
-                      for second in SNAPSHOTS:
+                      for second in snapshots:
                           if second not in reached:
                               next_times.append(read_started + second)
                       poll_deadline = min(next_times)
@@ -523,6 +606,12 @@ jobs:
                           continue
                       except BlockingIOError:
                           continue
+                      except OSError as error:
+                          result["socket_error"] = (
+                              f"{type(error).__name__}: {error}"
+                          )
+                          result["error"] = "large ECHO recv failed"
+                          break
 
                       if received == b"":
                           result["eof_seen"] = True
@@ -536,12 +625,7 @@ jobs:
                               time.monotonic() - read_started,
                               6,
                           )
-                      if received != expected[total:total + len(received)]:
-                          exact = False
-                          result["error"] = "response content mismatch"
-                          total += len(received)
-                          last_progress_time = time.monotonic()
-                          break
+                      response.extend(received)
                       total += len(received)
                       last_progress_time = time.monotonic()
                       result["last_progress_seconds"] = round(
@@ -550,18 +634,70 @@ jobs:
                       )
 
                   finished_at = time.monotonic()
+                  elapsed_seconds = finished_at - read_started
+                  final_no_progress = finished_at - last_progress_time
                   result["total_received"] = total
                   result["stall_duration_seconds"] = round(
-                      finished_at - last_progress_time,
+                      final_no_progress,
                       6,
                   )
+                  result["maximum_no_progress_seconds"] = round(
+                      max(
+                          result["maximum_no_progress_seconds"],
+                          final_no_progress,
+                      ),
+                      6,
+                  )
+                  if elapsed_seconds > 0.0:
+                      result["average_bytes_per_second"] = round(
+                          total / elapsed_seconds,
+                          3,
+                      )
+                  if total > 0:
+                      result["estimated_completion_seconds"] = round(
+                          elapsed_seconds * len(expected) / total,
+                          3,
+                      )
 
-                  if total == len(expected) and exact:
+          PY
+
+      - name: Append response validation and scenario cleanup
+        run: |
+          set -euxo pipefail
+          cat >> "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
+                  if total == len(expected):
+                      response_bytes = bytes(response)
+                      header = (
+                          b"$"
+                          + str(PAYLOAD_SIZE).encode("ascii")
+                          + b"\r\n"
+                      )
+                      payload_start = len(header)
+                      payload_end = payload_start + PAYLOAD_SIZE
+                      result["response_header_match"] = (
+                          response_bytes[:payload_start] == header
+                      )
+                      result["response_payload_match"] = (
+                          response_bytes[payload_start:payload_end]
+                          == expected[payload_start:payload_end]
+                      )
+                      result["response_trailing_crlf_match"] = (
+                          response_bytes[payload_end:] == b"\r\n"
+                      )
+                      result["response_exact_match"] = (
+                          response_bytes == expected
+                          and result["response_header_match"]
+                          and result["response_payload_match"]
+                          and result["response_trailing_crlf_match"]
+                      )
                       result["completion_seconds"] = round(
-                          finished_at - read_started,
+                          elapsed_seconds,
                           6,
                       )
-                      result["response_exact_match"] = True
+                      if not result["response_exact_match"]:
+                          result["error"] = (
+                              "complete response content mismatch"
+                          )
 
                       extra_deadline = time.monotonic() + 0.1
                       events = wait_for_fd(
@@ -590,6 +726,8 @@ jobs:
                           result["response_exact_match"]
                           and not result["eof_seen"]
                       ):
+                          result["ping_after_echo_attempted"] = True
+                          ping_started = time.monotonic()
                           try:
                               send_all(
                                   client,
@@ -598,20 +736,34 @@ jobs:
                               )
                               recv_exact(client, PONG, PING_TIMEOUT)
                               result["ping_after_echo_success"] = True
+                              result["ping_after_echo_response"] = (
+                                  PONG.decode("ascii")
+                              )
                           except BaseException as error:
-                              result["error"] = (
-                                  "same-connection PING failed: "
+                              result["ping_after_echo_error"] = (
                                   f"{type(error).__name__}: {error}"
+                              )
+                              result["error"] = (
+                                  "same-connection PING failed"
+                              )
+                          finally:
+                              result[
+                                  "ping_after_echo_elapsed_seconds"
+                              ] = round(
+                                  time.monotonic() - ping_started,
+                                  6,
                               )
 
               except BaseException as error:
                   result["error"] = f"{type(error).__name__}: {error}"
+                  if isinstance(error, OSError):
+                      result["socket_error"] = result["error"]
                   result["traceback"] = traceback.format_exc()
               finally:
                   for thread in probe_threads.values():
                       thread.join(timeout=PING_TIMEOUT + 1.0)
                   with probe_lock:
-                      for second in (5, 10):
+                      for second in ISOLATION_CHECKS:
                           if second in probe_threads:
                               result[
                                   f"second_client_ping_at_{second}s"
@@ -622,6 +774,9 @@ jobs:
                                       "pong_exact": False,
                                       "elapsed_seconds": None,
                                       "error": "probe thread did not finish",
+                                      "server_process_alive": (
+                                          server.alive()
+                                      ),
                                   },
                               )
                   if client is not None:
@@ -701,6 +856,37 @@ jobs:
                   isinstance(value, dict)
                   and value.get("connected") is True
                   and value.get("pong_exact") is True
+                  and value.get("server_process_alive", True) is True
+              )
+
+
+          def observed_liveness_ok(result):
+              observed = [
+                  result[f"server_alive_at_{second}s"]
+                  for second in LIVENESS_SNAPSHOTS
+                  if result[f"server_alive_at_{second}s"] is not None
+              ]
+              return bool(observed) and all(observed)
+
+
+          def observed_probes_ok(result):
+              observed = [
+                  result[f"second_client_ping_at_{second}s"]
+                  for second in ISOLATION_CHECKS
+                  if result[f"second_client_ping_at_{second}s"] is not None
+              ]
+              return bool(observed) and all(
+                  probe_ok(value) for value in observed
+              )
+
+
+          def observed_probe_failed(result):
+              return any(
+                  value is not None and not probe_ok(value)
+                  for value in (
+                      result[f"second_client_ping_at_{second}s"]
+                      for second in ISOLATION_CHECKS
+                  )
               )
 
 
@@ -710,30 +896,71 @@ jobs:
               a_ok = scenario_ok(scenario_a)
               d_completion = scenario_d["completion_seconds"]
               d_alive = not scenario_d["server_exited_during_scenario"]
+              formal_failed_at_large_echo = (
+                  formal["exit_code"] != 0
+                  and formal["failure_text_found"]
+                  and formal["failure_elapsed_seconds"] is not None
+                  and 4.0 <= formal["failure_elapsed_seconds"] <= 10.0
+              )
+              d_incomplete_at_5s = (
+                  scenario_d["bytes_at_5s"] is not None
+                  and scenario_d["bytes_at_5s"]
+                  < scenario_d["expected_response_size"]
+              )
+              d_content_exact = (
+                  scenario_d["response_exact_match"]
+                  and scenario_d["response_header_match"]
+                  and scenario_d["response_payload_match"]
+                  and scenario_d["response_trailing_crlf_match"]
+              )
+              d_no_stall = (
+                  scenario_d["maximum_no_progress_seconds"] < 10.0
+              )
+              d_transport_clean = (
+                  not scenario_d["eof_seen"]
+                  and scenario_d["socket_error"] is None
+                  and not scenario_d["extra_bytes_seen"]
+              )
 
               if (
-                  a_ok
+                  formal_failed_at_large_echo
+                  and a_ok
                   and d_completion is not None
+                  and d_incomplete_at_5s
                   and d_completion > 5.0
-                  and d_completion <= 30.0
-                  and scenario_d["response_exact_match"]
+                  and d_completion <= 120.0
+                  and d_content_exact
                   and scenario_d["ping_after_echo_success"]
                   and d_alive
                   and scenario_d["server_exit_code"] == 0
+                  and observed_liveness_ok(scenario_d)
+                  and observed_probes_ok(scenario_d)
+                  and d_no_stall
+                  and d_transport_clean
+                  and scenario_d["error"] is None
               ):
                   return (
                       "TEST_DEADLINE_TOO_STRICT",
-                      "The formal small receive-buffer case exceeded five "
-                      "seconds but completed exactly within thirty seconds; "
-                      "the connection remained reusable and the server lived.",
+                      "The formal integration failed near its five-second "
+                      "large-ECHO deadline, while the "
+                      f"{scenario_d['actual_rcvbuf_after_connect']}-byte "
+                      "effective Linux receive buffer caused much lower TCP "
+                      "flow-control "
+                      "throughput but continuous server output. The exact "
+                      "response completed within 120 seconds, the connection "
+                      "remained reusable, independent clients stayed "
+                      "responsive, and no ten-second stall occurred. The "
+                      "formal five-second absolute deadline is not a valid "
+                      "correctness requirement for this combination; there is "
+                      "no evidence that the production server needs a change.",
                   )
 
               if (
                   a_ok
-                  and formal["exit_code"] != 0
+                  and formal_failed_at_large_echo
                   and d_completion is not None
                   and d_completion <= 5.0
-                  and scenario_d["response_exact_match"]
+                  and d_content_exact
                   and scenario_d["ping_after_echo_success"]
               ):
                   return (
@@ -746,13 +973,11 @@ jobs:
               stalled = (
                   scenario_d["total_received"] > 0
                   and d_completion is None
-                  and scenario_d["stall_duration_seconds"] is not None
-                  and scenario_d["stall_duration_seconds"] >= 10.0
-                  and scenario_d["server_alive_at_5s"] is True
-                  and scenario_d["server_alive_at_10s"] is True
-                  and probe_ok(scenario_d["second_client_ping_at_5s"])
-                  and probe_ok(scenario_d["second_client_ping_at_10s"])
+                  and scenario_d["maximum_no_progress_seconds"] >= 10.0
+                  and observed_liveness_ok(scenario_d)
+                  and observed_probes_ok(scenario_d)
                   and not scenario_d["eof_seen"]
+                  and scenario_d["socket_error"] is None
               )
               if a_ok and stalled:
                   return (
@@ -767,10 +992,12 @@ jobs:
                   not a_ok
                   or scenario_d["server_exited_during_scenario"]
                   or scenario_d["eof_seen"]
+                  or scenario_d["socket_error"] is not None
+                  or observed_probe_failed(scenario_d)
                   or (
                       d_completion is not None
                       and (
-                          not scenario_d["response_exact_match"]
+                          not d_content_exact
                           or not scenario_d["ping_after_echo_success"]
                       )
                   )
@@ -788,8 +1015,10 @@ jobs:
 
               return (
                   "INCONCLUSIVE",
-                  "The observations do not satisfy a frozen classification; "
-                  "inspect byte snapshots, liveness, and socket diagnostics.",
+                  "The 120-second observation did not satisfy a frozen "
+                  "classification. Inspect byte snapshots, liveness, socket "
+                  "diagnostics, and estimated completion time "
+                  f"{scenario_d['estimated_completion_seconds']!r} seconds.",
               )
 
 
@@ -833,6 +1062,7 @@ jobs:
                       False,
                       10.0,
                       False,
+                      False,
                   ),
                   (
                       "scenario_b",
@@ -840,6 +1070,7 @@ jobs:
                       None,
                       True,
                       30.0,
+                      False,
                       False,
                   ),
                   (
@@ -849,13 +1080,15 @@ jobs:
                       False,
                       30.0,
                       False,
+                      False,
                   ),
                   (
                       "scenario_d",
                       "small receive buffer, formal isolation delay",
                       REQUESTED_SMALL_RCVBUF,
                       True,
-                      30.0,
+                      120.0,
+                      True,
                       True,
                   ),
               ]
@@ -867,6 +1100,7 @@ jobs:
                   use_formal_delay,
                   deadline_seconds,
                   schedule_checks,
+                  set_rcvbuf_before_connect,
               ) in definitions:
                   print(f"START: {name}", flush=True)
                   scenarios[key] = run_scenario(
@@ -879,6 +1113,7 @@ jobs:
                       use_formal_delay,
                       deadline_seconds,
                       schedule_checks,
+                      set_rcvbuf_before_connect,
                   )
                   print(
                       f"END: {name}: "
@@ -952,6 +1187,13 @@ jobs:
               "scenario_d",
               "SO_RCVBUF",
               "1048576",
+              "120",
+              "bytes_at_60s",
+              "bytes_at_90s",
+              "bytes_at_120s",
+              "ping_after_echo_success",
+              "response_exact_match",
+              "maximum_no_progress_seconds",
           ]
           missing = [item for item in required if item not in text]
           if missing:
