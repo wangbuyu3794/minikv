@@ -140,6 +140,7 @@ jobs:
           )
           LIVENESS_SNAPSHOTS = (5, 10, 30, 60, 90, 120)
           ISOLATION_CHECKS = (5, 10, 30, 60, 90)
+          FORMAL_CONNECT_BEFORE_RCVBUF_SET = True
 
 
           def remaining_milliseconds(deadline):
@@ -169,20 +170,13 @@ jobs:
               port,
               requested_rcvbuf=None,
               timeout=PING_TIMEOUT,
-              set_rcvbuf_before_connect=False,
           ):
               client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
               client.setblocking(False)
-              if (
-                  requested_rcvbuf is not None
-                  and set_rcvbuf_before_connect
-              ):
-                  client.setsockopt(
-                      socket.SOL_SOCKET,
-                      socket.SO_RCVBUF,
-                      requested_rcvbuf,
-                  )
-              before = client.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+              socket_created = client.getsockopt(
+                  socket.SOL_SOCKET,
+                  socket.SO_RCVBUF,
+              )
               deadline = time.monotonic() + timeout
               error = client.connect_ex(("127.0.0.1", port))
               if error not in (0, errno.EINPROGRESS, errno.EINTR):
@@ -206,17 +200,26 @@ jobs:
                       client.close()
                       raise OSError(socket_error, os.strerror(socket_error))
 
-              if (
-                  requested_rcvbuf is not None
-                  and not set_rcvbuf_before_connect
-              ):
+              connected_before_set = client.getsockopt(
+                  socket.SOL_SOCKET,
+                  socket.SO_RCVBUF,
+              )
+              if requested_rcvbuf is not None:
                   client.setsockopt(
                       socket.SOL_SOCKET,
                       socket.SO_RCVBUF,
                       requested_rcvbuf,
                   )
-              after = client.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-              return client, before, after
+              connected_after_set = client.getsockopt(
+                  socket.SOL_SOCKET,
+                  socket.SO_RCVBUF,
+              )
+              return (
+                  client,
+                  socket_created,
+                  connected_before_set,
+                  connected_after_set,
+              )
 
 
           def send_all(client, data, timeout=SEND_TIMEOUT):
@@ -279,7 +282,10 @@ jobs:
               }
               client = None
               try:
-                  client, _, _ = connect_client(port, timeout=PING_TIMEOUT)
+                  client, _, _, _ = connect_client(
+                      port,
+                      timeout=PING_TIMEOUT,
+                  )
                   result["connected"] = True
                   send_all(client, b"*1\r\n$4\r\nPING\r\n", PING_TIMEOUT)
                   recv_exact(client, PONG, PING_TIMEOUT)
@@ -400,11 +406,30 @@ jobs:
               result = {
                   "name": name,
                   "requested_rcvbuf": requested_rcvbuf,
+                  "rcvbuf_socket_created": None,
+                  "rcvbuf_connected_before_set": None,
+                  "rcvbuf_connected_after_set": None,
                   "actual_rcvbuf_before_connect": None,
                   "actual_rcvbuf_after_connect": None,
+                  "socket_setup_equivalent_to_formal": False,
+                  "connect_before_rcvbuf_set": False,
+                  "formal_connect_before_rcvbuf_set": (
+                      FORMAL_CONNECT_BEFORE_RCVBUF_SET
+                  ),
+                  "receive_start_equivalent_to_formal": False,
+                  "scenario_equivalent_to_formal": False,
                   "payload_size": payload_size,
                   "expected_response_size": expected_size,
                   "deadline_seconds": None,
+                  "request_send_started_seconds": None,
+                  "request_send_completed_seconds": None,
+                  "isolation_ping_started_seconds": None,
+                  "isolation_ping_completed_seconds": None,
+                  "receive_started_seconds": None,
+                  "receive_deadline_seconds": None,
+                  "first_byte_seconds_from_receive_start": None,
+                  "completion_seconds_from_receive_start": None,
+                  "completion_seconds_from_request_send": None,
                   "read_delay_seconds": None,
                   "formal_isolation_ping": None,
                   "first_byte_seconds": None,
@@ -477,7 +502,7 @@ jobs:
               use_formal_delay,
               deadline_seconds,
               schedule_isolation_checks,
-              set_rcvbuf_before_connect,
+              formal_timing_equivalent,
           ):
               result = initial_scenario_result(
                   name,
@@ -519,21 +544,64 @@ jobs:
 
               try:
                   server.start()
-                  client, before, after = connect_client(
+                  timeline_origin = time.monotonic()
+                  (
+                      client,
+                      socket_created,
+                      connected_before_set,
+                      connected_after_set,
+                  ) = connect_client(
                       server.port,
                       requested_rcvbuf=requested_rcvbuf,
                       timeout=PING_TIMEOUT,
-                      set_rcvbuf_before_connect=(
-                          set_rcvbuf_before_connect
-                      ),
                   )
-                  result["actual_rcvbuf_before_connect"] = before
-                  result["actual_rcvbuf_after_connect"] = after
+                  result["rcvbuf_socket_created"] = socket_created
+                  result[
+                      "rcvbuf_connected_before_set"
+                  ] = connected_before_set
+                  result[
+                      "rcvbuf_connected_after_set"
+                  ] = connected_after_set
+                  result[
+                      "actual_rcvbuf_before_connect"
+                  ] = socket_created
+                  result[
+                      "actual_rcvbuf_after_connect"
+                  ] = connected_after_set
+                  result["connect_before_rcvbuf_set"] = (
+                      requested_rcvbuf is not None
+                  )
+                  result[
+                      "socket_setup_equivalent_to_formal"
+                  ] = (
+                      formal_timing_equivalent
+                      and requested_rcvbuf == REQUESTED_SMALL_RCVBUF
+                      and result["connect_before_rcvbuf_set"]
+                      and FORMAL_CONNECT_BEFORE_RCVBUF_SET
+                  )
+
+                  request_send_started = time.monotonic()
+                  result["request_send_started_seconds"] = round(
+                      request_send_started - timeline_origin,
+                      6,
+                  )
                   send_all(client, request, SEND_TIMEOUT)
+                  result["request_send_completed_seconds"] = round(
+                      time.monotonic() - timeline_origin,
+                      6,
+                  )
 
                   delay_started = time.monotonic()
                   if use_formal_delay:
+                      result["isolation_ping_started_seconds"] = round(
+                          delay_started - timeline_origin,
+                          6,
+                      )
                       result["formal_isolation_ping"] = ping_server(server.port)
+                      result["isolation_ping_completed_seconds"] = round(
+                          time.monotonic() - timeline_origin,
+                          6,
+                      )
                   result["read_delay_seconds"] = round(
                       time.monotonic() - delay_started,
                       6,
@@ -542,6 +610,38 @@ jobs:
                   read_started = time.monotonic()
                   last_progress_time = read_started
                   deadline = read_started + deadline_seconds
+                  result["receive_started_seconds"] = round(
+                      read_started - timeline_origin,
+                      6,
+                  )
+                  result["receive_deadline_seconds"] = round(
+                      deadline - timeline_origin,
+                      6,
+                  )
+                  result[
+                      "receive_start_equivalent_to_formal"
+                  ] = (
+                      formal_timing_equivalent
+                      and use_formal_delay
+                      and result[
+                          "isolation_ping_completed_seconds"
+                      ] is not None
+                      and result[
+                          "isolation_ping_completed_seconds"
+                      ] <= result["receive_started_seconds"]
+                  )
+                  result["scenario_equivalent_to_formal"] = (
+                      result["socket_setup_equivalent_to_formal"]
+                      and result["receive_start_equivalent_to_formal"]
+                      and result["request_send_started_seconds"]
+                      <= result["request_send_completed_seconds"]
+                      and result["request_send_completed_seconds"]
+                      <= result["isolation_ping_started_seconds"]
+                      and result["isolation_ping_started_seconds"]
+                      <= result["isolation_ping_completed_seconds"]
+                      and result["isolation_ping_completed_seconds"]
+                      <= result["receive_started_seconds"]
+                  )
 
           PY
 
@@ -625,6 +725,9 @@ jobs:
                               time.monotonic() - read_started,
                               6,
                           )
+                          result[
+                              "first_byte_seconds_from_receive_start"
+                          ] = result["first_byte_seconds"]
                       response.extend(received)
                       total += len(received)
                       last_progress_time = time.monotonic()
@@ -692,6 +795,15 @@ jobs:
                       )
                       result["completion_seconds"] = round(
                           elapsed_seconds,
+                          6,
+                      )
+                      result[
+                          "completion_seconds_from_receive_start"
+                      ] = result["completion_seconds"]
+                      result[
+                          "completion_seconds_from_request_send"
+                      ] = round(
+                          finished_at - request_send_started,
                           6,
                       )
                       if not result["response_exact_match"]:
@@ -896,6 +1008,19 @@ jobs:
               a_ok = scenario_ok(scenario_a)
               d_completion = scenario_d["completion_seconds"]
               d_alive = not scenario_d["server_exited_during_scenario"]
+              d_equivalent = (
+                  scenario_d["scenario_equivalent_to_formal"] is True
+                  and scenario_d[
+                      "socket_setup_equivalent_to_formal"
+                  ] is True
+                  and scenario_d["connect_before_rcvbuf_set"] is True
+                  and scenario_d[
+                      "formal_connect_before_rcvbuf_set"
+                  ] is True
+                  and scenario_d[
+                      "receive_start_equivalent_to_formal"
+                  ] is True
+              )
               formal_failed_at_large_echo = (
                   formal["exit_code"] != 0
                   and formal["failure_text_found"]
@@ -922,11 +1047,23 @@ jobs:
                   and not scenario_d["extra_bytes_seen"]
               )
 
+              if not d_equivalent:
+                  return (
+                      "INCONCLUSIVE",
+                      "Scenario D is not equivalent to the formal socket "
+                      "setup, request order, and receive-deadline start; no "
+                      "formal or server diagnosis can be made.",
+                  )
+
               if (
                   formal_failed_at_large_echo
                   and a_ok
+                  and scenario_d["requested_rcvbuf"]
+                  == REQUESTED_SMALL_RCVBUF
+                  and scenario_d["rcvbuf_connected_after_set"] is not None
                   and d_completion is not None
                   and d_incomplete_at_5s
+                  and scenario_d["bytes_at_5s"] > 0
                   and d_completion > 5.0
                   and d_completion <= 120.0
                   and d_content_exact
@@ -935,6 +1072,7 @@ jobs:
                   and scenario_d["server_exit_code"] == 0
                   and observed_liveness_ok(scenario_d)
                   and observed_probes_ok(scenario_d)
+                  and probe_ok(scenario_d["formal_isolation_ping"])
                   and d_no_stall
                   and d_transport_clean
                   and scenario_d["error"] is None
@@ -942,32 +1080,16 @@ jobs:
                   return (
                       "TEST_DEADLINE_TOO_STRICT",
                       "The formal integration failed near its five-second "
-                      "large-ECHO deadline, while the "
-                      f"{scenario_d['actual_rcvbuf_after_connect']}-byte "
-                      "effective Linux receive buffer caused much lower TCP "
-                      "flow-control "
-                      "throughput but continuous server output. The exact "
-                      "response completed within 120 seconds, the connection "
-                      "remained reusable, independent clients stayed "
-                      "responsive, and no ten-second stall occurred. The "
-                      "formal five-second absolute deadline is not a valid "
-                      "correctness requirement for this combination; there is "
-                      "no evidence that the production server needs a change.",
-                  )
-
-              if (
-                  a_ok
-                  and formal_failed_at_large_echo
-                  and d_completion is not None
-                  and d_completion <= 5.0
-                  and d_content_exact
-                  and scenario_d["ping_after_echo_success"]
-              ):
-                  return (
-                      "FORMAL_TEST_LOGIC_PROBLEM",
-                      "The equivalent diagnostic case completed within the "
-                      "formal five-second limit while the formal integration "
-                      "failed, indicating helper or scenario logic mismatch.",
+                      "large-ECHO deadline. With post-connect SO_RCVBUF set to "
+                      f"{scenario_d['rcvbuf_connected_after_set']} bytes, "
+                      "Linux TCP receive-window flow control greatly reduced "
+                      "throughput, but server output progressed continuously "
+                      "and the exact response completed within 120 seconds. "
+                      "The connection remained reusable, independent clients "
+                      "stayed responsive, and no ten-second stall occurred. "
+                      "The formal five-second deadline does not fit this "
+                      "extreme test combination; production server changes "
+                      "are not supported by the evidence.",
                   )
 
               stalled = (
@@ -1100,7 +1222,7 @@ jobs:
                   use_formal_delay,
                   deadline_seconds,
                   schedule_checks,
-                  set_rcvbuf_before_connect,
+                  formal_timing_equivalent,
               ) in definitions:
                   print(f"START: {name}", flush=True)
                   scenarios[key] = run_scenario(
@@ -1113,7 +1235,7 @@ jobs:
                       use_formal_delay,
                       deadline_seconds,
                       schedule_checks,
-                      set_rcvbuf_before_connect,
+                      formal_timing_equivalent,
                   )
                   print(
                       f"END: {name}: "
@@ -1194,6 +1316,13 @@ jobs:
               "ping_after_echo_success",
               "response_exact_match",
               "maximum_no_progress_seconds",
+              "connect_before_rcvbuf_set",
+              "formal_connect_before_rcvbuf_set",
+              "socket_setup_equivalent_to_formal",
+              "receive_start_equivalent_to_formal",
+              "scenario_equivalent_to_formal",
+              "rcvbuf_connected_before_set",
+              "rcvbuf_connected_after_set",
           ]
           missing = [item for item in required if item not in text]
           if missing:
