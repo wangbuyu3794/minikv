@@ -82,6 +82,42 @@ minikv_enable_warnings(minikv-server)
 include(CTest)
 
 if(BUILD_TESTING)
+    add_executable(minikv_resp2_parser_test
+        tests/resp2_parser_test.c
+    )
+
+    target_include_directories(minikv_resp2_parser_test
+        PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    target_compile_definitions(minikv_resp2_parser_test
+        PRIVATE
+            MINIKV_RESP2_TESTING
+    )
+
+    target_link_libraries(minikv_resp2_parser_test
+        PRIVATE
+            minikv_resp2
+    )
+
+    set_target_properties(minikv_resp2_parser_test PROPERTIES
+        C_STANDARD 17
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF
+    )
+
+    minikv_enable_warnings(minikv_resp2_parser_test)
+
+    add_test(
+        NAME minikv.resp2.parser
+        COMMAND minikv_resp2_parser_test
+    )
+
+    set_tests_properties(minikv.resp2.parser PROPERTIES
+        TIMEOUT 30
+    )
+
     add_executable(minikv_smoke
         tests/smoke_test.c
     )
