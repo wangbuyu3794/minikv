@@ -25,8 +25,10 @@ jobs:
             build_type: Release
 
     env:
-      BUILD_DIR: build/m3-diagnosis-${{ matrix.compiler }}-${{ matrix.build_type }}
+      BUILD_DIR: build/m3-diagnosis
       CC: ${{ matrix.compiler }}
+      M3_BUILD_TYPE: ${{ matrix.build_type }}
+      M3_COMPILER: ${{ matrix.compiler }}
 
     steps:
       - name: Checkout
@@ -46,7 +48,7 @@ jobs:
         run: |
           set -euxo pipefail
           cmake -S . -B "$BUILD_DIR" \
-            -DCMAKE_BUILD_TYPE="${{ matrix.build_type }}" \
+            -DCMAKE_BUILD_TYPE="$M3_BUILD_TYPE" \
             -DCMAKE_C_COMPILER="$CC" \
             -DBUILD_TESTING=ON
 
@@ -92,14 +94,14 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/formal-integration.log"
           formal_status=${PIPESTATUS[0]}
           set -e
-          echo "$formal_status" > "$RUNNER_TEMP/formal-integration.status"
+          printf '%s\n' "$formal_status" \
+            > "$RUNNER_TEMP/formal-integration-status.txt"
           echo "formal integration exit code: $formal_status"
 
-      - name: Run large ECHO diagnosis
+      - name: Write diagnosis script header and socket helpers
         run: |
           set -euxo pipefail
           cat > "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
-          import argparse
           import errno
           import json
           import os
@@ -113,7 +115,7 @@ jobs:
           import traceback
           from pathlib import Path
 
-          PAYLOAD_SIZE = 1024 * 1024
+          PAYLOAD_SIZE = 1048576
           REQUESTED_SMALL_RCVBUF = 1024
           START_TIMEOUT = 5.0
           SEND_TIMEOUT = 5.0
@@ -261,6 +263,12 @@ jobs:
               return result
 
 
+          PY
+
+      - name: Append process and measurement helpers
+        run: |
+          set -euxo pipefail
+          cat >> "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
           class ServerProcess:
               def __init__(self, executable, pid_path):
                   self.executable = os.path.abspath(executable)
@@ -395,6 +403,12 @@ jobs:
               return result
 
 
+          PY
+
+      - name: Append scenario runner
+        run: |
+          set -euxo pipefail
+          cat >> "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
           def run_scenario(
               name,
               executable,
@@ -632,6 +646,12 @@ jobs:
               return result
 
 
+          PY
+
+      - name: Append formal parsing and classification logic
+        run: |
+          set -euxo pipefail
+          cat >> "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
           def parse_formal_result(log_path, status_path):
               log = Path(log_path).read_text(
                   encoding="utf-8",
@@ -773,16 +793,20 @@ jobs:
               )
 
 
+          PY
+
+      - name: Append main entry point
+        run: |
+          set -euxo pipefail
+          cat >> "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
           def main():
-              parser = argparse.ArgumentParser()
-              parser.add_argument("--server", required=True)
-              parser.add_argument("--formal-log", required=True)
-              parser.add_argument("--formal-status", required=True)
-              parser.add_argument("--result", required=True)
-              parser.add_argument("--pid-file", required=True)
-              parser.add_argument("--compiler", required=True)
-              parser.add_argument("--build-type", required=True)
-              arguments = parser.parse_args()
+              server_path = os.environ["M3_SERVER_PATH"]
+              formal_log_path = os.environ["M3_FORMAL_LOG_PATH"]
+              formal_status_path = os.environ["M3_FORMAL_STATUS_PATH"]
+              result_path = os.environ["M3_RESULT_PATH"]
+              pid_file_path = os.environ["M3_PID_FILE_PATH"]
+              compiler = os.environ["M3_COMPILER"]
+              build_type = os.environ["M3_BUILD_TYPE"]
 
               payload = bytes(index % 251 for index in range(PAYLOAD_SIZE))
               payload_length = str(PAYLOAD_SIZE).encode("ascii")
@@ -847,8 +871,8 @@ jobs:
                   print(f"START: {name}", flush=True)
                   scenarios[key] = run_scenario(
                       name,
-                      arguments.server,
-                      arguments.pid_file,
+                      server_path,
+                      pid_file_path,
                       request,
                       expected,
                       requested_rcvbuf,
@@ -865,13 +889,13 @@ jobs:
                   )
 
               formal = parse_formal_result(
-                  arguments.formal_log,
-                  arguments.formal_status,
+                  formal_log_path,
+                  formal_status_path,
               )
               classification, reason = classify(formal, scenarios)
               document = {
-                  "compiler": arguments.compiler,
-                  "build_type": arguments.build_type,
+                  "compiler": compiler,
+                  "build_type": build_type,
                   "formal_integration_exit_code": formal["exit_code"],
                   "formal_failure_text_found": formal["failure_text_found"],
                   "formal_failure_elapsed_seconds": (
@@ -886,7 +910,7 @@ jobs:
                   "reason": reason,
                   "project_compiler_warnings": 0,
               }
-              Path(arguments.result).write_text(
+              Path(result_path).write_text(
                   json.dumps(document, indent=2, sort_keys=True) + "\n",
                   encoding="utf-8",
               )
@@ -898,14 +922,56 @@ jobs:
               main()
           PY
 
-          python3 "$RUNNER_TEMP/m3_large_echo_diagnosis.py" \
-            --server "$BUILD_DIR/minikv-server" \
-            --formal-log "$RUNNER_TEMP/formal-integration.log" \
-            --formal-status "$RUNNER_TEMP/formal-integration.status" \
-            --result "$RUNNER_TEMP/m3-large-echo-result.json" \
-            --pid-file "$RUNNER_TEMP/m3-large-echo-server.pid" \
-            --compiler "${{ matrix.compiler }}" \
-            --build-type "${{ matrix.build_type }}"
+      - name: Validate diagnosis script
+        run: |
+          set -euxo pipefail
+          python3 -m py_compile \
+            "$RUNNER_TEMP/m3_large_echo_diagnosis.py"
+
+          python3 - "$RUNNER_TEMP/m3_large_echo_diagnosis.py" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          data = path.read_bytes()
+
+          assert data
+          assert b"\x00" not in data
+          assert not data.startswith(b"\xef\xbb\xbf")
+
+          text = data.decode("utf-8")
+          required = [
+              "TEST_DEADLINE_TOO_STRICT",
+              "FORMAL_TEST_LOGIC_PROBLEM",
+              "SERVER_OUTPUT_STALL",
+              "SERVER_CONNECTION_FAILURE",
+              "INCONCLUSIVE",
+              "scenario_a",
+              "scenario_b",
+              "scenario_c",
+              "scenario_d",
+              "SO_RCVBUF",
+              "1048576",
+          ]
+          missing = [item for item in required if item not in text]
+          if missing:
+              raise SystemExit(
+                  f"missing diagnosis script tokens: {missing}"
+              )
+
+          print(f"diagnosis script bytes: {len(data)}")
+          print(f"diagnosis script lines: {len(text.splitlines())}")
+          PY
+
+      - name: Run large ECHO diagnosis
+        run: |
+          set -euxo pipefail
+          export M3_SERVER_PATH="$GITHUB_WORKSPACE/$BUILD_DIR/minikv-server"
+          export M3_FORMAL_LOG_PATH="$RUNNER_TEMP/formal-integration.log"
+          export M3_FORMAL_STATUS_PATH="$RUNNER_TEMP/formal-integration-status.txt"
+          export M3_RESULT_PATH="$RUNNER_TEMP/m3-large-echo-result.json"
+          export M3_PID_FILE_PATH="$RUNNER_TEMP/m3-large-echo-server.pid"
+          python3 "$RUNNER_TEMP/m3_large_echo_diagnosis.py"
 
       - name: Output diagnosis JSON
         run: |
