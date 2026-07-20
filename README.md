@@ -4,25 +4,28 @@ MiniKV is an educational key-value server written in C17. The project aims to
 build a Redis-compatible protocol and database features incrementally, with
 Linux as its primary runtime platform.
 
-The current M2 milestone contains:
+The current M3 milestone contains:
 
 - the M1 Linux nonblocking TCP server skeleton;
-- a platform-neutral incremental RESP2 parser.
+- the M2 platform-neutral incremental RESP2 parser;
+- a platform-neutral RESP2 response encoder and command dispatcher;
+- a Linux RESP2 request-response loop with `PING` and `ECHO`;
+- fragmented-input and pipelined-request handling;
+- buffered nonblocking output with per-client backpressure isolation.
 
-The parser is not connected to the network server. MiniKV does not execute or
-dispatch commands, implement `PING`, `ECHO`, `GET`, or `SET`, store data, or
-send protocol responses. It has no TTL, persistence, or authentication and is
-not a usable Redis server.
+MiniKV remains an educational, incremental project rather than a Redis
+replacement. It does not implement a key-value database, `GET`, `SET`, TTL,
+persistence, authentication, RESP3, or full Redis compatibility.
 
 ## M1 network server
 
-On Linux, the server currently provides:
+M1 introduced the Linux server runtime with:
 
 - an IPv4 TCP listener;
 - nonblocking and close-on-exec file descriptors;
 - level-triggered epoll;
 - accept queue draining;
-- receiving and discarding client data;
+- nonblocking client input;
 - cleanup when clients disconnect;
 - SIGINT and SIGTERM handling through signalfd;
 - a successful exit status after a normal signal-driven stop.
@@ -30,9 +33,8 @@ On Linux, the server currently provides:
 The default address is `127.0.0.1`, the default port is `6379`, and port 0
 requests an ephemeral port. Bind addresses must be numeric IPv4 addresses.
 
-The server drains accepted client data and discards it. It does not parse that
-data, execute commands, or send a response. The M2 parser is not connected to
-client sockets yet.
+M3 now connects RESP2 parsing and command execution to these client sockets.
+The network and signal-handling foundation remains the M1 design.
 
 ## M2 RESP2 parser
 
@@ -73,6 +75,12 @@ transfers to the caller, independently of the input buffer.
 reset and destroy operations release any incomplete state still owned by the
 parser.
 
+The response encoder and command dispatcher also use internal declarations.
+The encoder does not allocate memory: callers provide the destination buffer.
+Command replies either reference static data or temporarily borrow a Bulk
+String payload from the parsed request. The caller must encode a borrowed reply
+before destroying that request.
+
 ## RESP2 resource limits
 
 The parser uses these defaults:
@@ -90,6 +98,49 @@ Limits are copied into each parser, and tests can supply smaller custom limits.
 Length, growth, payload-total, and allocation-size arithmetic is checked for
 overflow.
 
+## M3 RESP2 command loop
+
+On Linux, each accepted connection owns an independent incremental parser and
+an output buffer. The server reads nonblocking socket input, parses complete
+RESP2 requests, dispatches commands, encodes replies, and queues those replies
+for nonblocking delivery.
+
+Commands are case-insensitive for ASCII letters and must use a RESP2 Array of
+one or more non-null Bulk Strings. The first element is the non-empty command
+name. Arguments are also non-null Bulk Strings. Other complete RESP2 values,
+nested command elements, and null Bulk String elements are protocol errors.
+
+The implemented commands are:
+
+- `PING` returns the Simple String `PONG`;
+- `PING <message>` returns `<message>` as a binary-safe Bulk String;
+- `ECHO <message>` returns `<message>` as a binary-safe Bulk String;
+- wrong command arity returns a command-specific Simple Error;
+- an otherwise valid but unknown command returns
+  `-ERR unknown command\r\n`.
+
+`PING` and `ECHO` messages may contain NUL, CR, LF, and CRLF bytes. Input may
+arrive in arbitrary fragments, and multiple requests may be pipelined in one
+byte stream. Replies remain in request order.
+
+Client output is buffered per connection. The level-triggered event loop
+enables `EPOLLOUT` only while bytes are pending, handles partial writes,
+`EINTR`, and `EAGAIN`, and keeps other clients responsive when one client
+delays reading. Pending output is limited to 33,554,432 bytes (32 MiB) per
+connection; a reply that would exceed the limit closes only that client
+without sending a partial reply.
+
+For malformed RESP2 or an invalid command-frame shape, the server attempts to
+send the exact response `-ERR Protocol error\r\n` after any already queued
+complete replies, then closes the connection. Allocation failures and internal
+state errors close the affected connection without being reported as client
+protocol errors.
+
+When a peer half-closes after a complete request, queued replies are sent
+before the server closes the connection. If EOF arrives with an incomplete
+request, the server closes the connection without fabricating a protocol-error
+response.
+
 ## Requirements
 
 - CMake 3.16 or newer
@@ -100,16 +151,18 @@ MiniKV has no third-party runtime dependencies.
 
 ## Platform support
 
-The `minikv_resp2` static library and its test are platform-neutral. They use
-standard C17 and do not depend on the server runtime.
+The `minikv_resp2` and `minikv_command` static libraries and their unit tests
+are platform-neutral. They use standard C17 and do not depend on the Linux
+server runtime.
 
 Linux uses the real socket, level-triggered epoll, and signalfd server backend.
 Other platforms build the command-line program with an unsupported network
 backend; help remains available, but attempting to start the service reports
 that networking is unsupported and returns an error.
 
-A Windows build validates the platform-neutral parser, CLI, and core behavior.
-It does not compile or validate the Linux network backend.
+A Windows build validates the platform-neutral parser, encoder, command
+dispatcher, CLI help, and core behavior. It does not compile or validate the
+Linux network backend or the RESP2 network command loop.
 
 ## Command-line interface
 
@@ -147,20 +200,28 @@ The current exit-status behavior is:
 - `2`: a command-line syntax error, such as an unknown, duplicate, missing, or
   out-of-range argument.
 
-## Build and test on Linux
+## Build and run on Linux
 
 Run these commands from the repository root:
 
 ```sh
-cmake -S . -B build/linux \
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build build
+
+./build/minikv-server --help
+./build/minikv-server --bind 127.0.0.1 --port 6379
+```
+
+## Test on Linux
+
+Use a separate build tree when enabling tests:
+
+```sh
+cmake -S . -B build-tests \
   -DCMAKE_BUILD_TYPE=Debug \
   -DBUILD_TESTING=ON
-
-cmake --build build/linux --parallel
-
-ctest --test-dir build/linux \
-  --output-on-failure \
-  --no-tests=error
+cmake --build build-tests
+ctest --test-dir build-tests --output-on-failure
 ```
 
 Linux registers these CTest tests:
@@ -169,22 +230,22 @@ Linux registers these CTest tests:
 - `minikv.server.help`
 - `minikv.server.short-help`
 - `minikv.resp2.parser`
+- `minikv.resp2.encoder`
+- `minikv.command`
 - `minikv.server.linux`
 - `minikv.server.integration`
 
-The platform-neutral parser test covers valid values, binary payloads,
-fragmented input, consumed-byte boundaries, invalid syntax, resource limits,
-lifecycle behavior, and deterministic allocation failures.
-
-The lifecycle test directly exercises the runtime interface, file-descriptor
-flags, accept draining, data draining, and connection cleanup. The integration
-test uses fork and exec to start the real `minikv-server` executable and checks
-ephemeral-port startup, a real TCP connection, SIGTERM shutdown, and CLI exit
-statuses.
+The platform-neutral tests cover parsing, encoding, command dispatch, binary
+payloads, invalid input, resource limits, overflow checks, and ownership. The
+Linux lifecycle test deterministically covers forced `EAGAIN`, short writes,
+pipeline ordering, output-limit boundaries, and connection cleanup. The
+integration test starts the real `minikv-server` process and covers fragmented
+requests, pipelines, multiple clients, protocol errors, half-close and EOF
+behavior, large `ECHO` replies, backpressure isolation, connection reuse, and
+signal-driven shutdown.
 
 The existing GitHub Actions workflow configures testing and will run all
 registered Linux CTests for GCC and Clang in Debug and Release configurations.
-This M2 branch has not yet received formal remote Linux CI validation.
 
 ## Build and test on Windows
 
@@ -208,12 +269,16 @@ Windows registers these platform-neutral tests:
 - `minikv.server.help`
 - `minikv.server.short-help`
 - `minikv.resp2.parser`
+- `minikv.resp2.encoder`
+- `minikv.command`
 
-The parser test has been run locally with MinGW in Debug and Release
-configurations. Linux-specific server tests remain registered only on Linux.
+Linux-specific lifecycle and integration tests remain registered only on
+Linux. Non-Linux builds use the unsupported server backend and do not validate
+the real network command loop.
 
-With `BUILD_TESTING=OFF`, CMake still builds the `minikv_resp2` library but does
-not build or register `minikv_resp2_parser_test`.
+With `BUILD_TESTING=OFF`, CMake still builds the production libraries and
+`minikv-server`, including `minikv_resp2` and `minikv_command`, but does not
+build or register test executables or test-only hooks.
 
 ## Repository layout
 
@@ -221,45 +286,50 @@ not build or register `minikv_resp2_parser_test`.
 .github/workflows/ci.yml
 apps/minikv_server.c
 include/minikv/version.h
-src/version.c
+src/command.c
+src/command_internal.h
 src/resp2_internal.h
+src/resp2_encoder.c
 src/resp2_parser.c
 src/server_internal.h
 src/server_linux.c
 src/server_unsupported.c
+src/version.c
+tests/command_test.c
+tests/resp2_encoder_test.c
 tests/resp2_parser_test.c
-tests/smoke_test.c
-tests/server_linux_test.c
 tests/server_integration_test.c
+tests/server_linux_test.c
+tests/smoke_test.c
 CMakeLists.txt
 README.md
 ```
 
 Executable entry points live in `apps/`, reusable implementation lives in
 `src/`, public headers live under `include/minikv/`, and tests live in `tests/`.
-`src/server_internal.h` is an internal runtime and test interface, not a stable
-public API. `src/resp2_internal.h` has the same internal status.
+`src/server_internal.h`, `src/resp2_internal.h`, and
+`src/command_internal.h` are internal runtime and test interfaces, not stable
+public APIs.
 
-`minikv_resp2` is a platform-neutral static library.
-`minikv_resp2_parser_test` links only to that library, not to
-`minikv_server_runtime`.
+`minikv_resp2` and `minikv_command` are platform-neutral static libraries. The
+Linux `minikv_server_runtime` links them to provide the network command loop;
+the unsupported backend does not.
 
 ## Current limitations
 
-- the RESP2 parser is not connected to the server runtime;
-- no RESP encoder;
 - no inline commands;
 - no RESP3;
-- no command parsing, dispatch, or execution;
-- no network protocol responses;
+- only `PING` and `ECHO` commands;
+- no `GET`, `SET`, or other database commands;
 - no database storage;
 - no TTL;
 - no persistence;
 - no authentication;
+- no multithreading;
+- no full Redis compatibility;
 - numeric IPv4 server bind addresses only;
 - no parser EOF or finalize operation;
 - the real network backend currently targets Linux.
 
-Planned directions include connecting RESP2 parsing to client connections,
-adding command dispatch and basic commands, and then adding an in-memory
-database and TTL. No release dates are promised.
+Future milestones may add database functionality, but no release dates or
+feature commitments are promised.
