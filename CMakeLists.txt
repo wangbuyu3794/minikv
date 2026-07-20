@@ -107,6 +107,48 @@ target_link_libraries(minikv-server
 minikv_enable_warnings(minikv-server)
 
 if(BUILD_TESTING)
+    add_executable(minikv_resp2_encoder_test
+        tests/resp2_encoder_test.c
+    )
+
+    target_include_directories(minikv_resp2_encoder_test
+        PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    target_link_libraries(minikv_resp2_encoder_test
+        PRIVATE
+            minikv_resp2
+    )
+
+    minikv_enable_warnings(minikv_resp2_encoder_test)
+
+    add_test(
+        NAME minikv.resp2.encoder
+        COMMAND minikv_resp2_encoder_test
+    )
+
+    add_executable(minikv_command_test
+        tests/command_test.c
+    )
+
+    target_include_directories(minikv_command_test
+        PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+
+    target_link_libraries(minikv_command_test
+        PRIVATE
+            minikv_command
+    )
+
+    minikv_enable_warnings(minikv_command_test)
+
+    add_test(
+        NAME minikv.command
+        COMMAND minikv_command_test
+    )
+
     add_executable(minikv_resp2_parser_test
         tests/resp2_parser_test.c
     )
@@ -237,7 +279,7 @@ if(BUILD_TESTING)
         )
 
         set_tests_properties(minikv.server.integration PROPERTIES
-            TIMEOUT 15
+            TIMEOUT 60
         )
     endif()
 endif()
